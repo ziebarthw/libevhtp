@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <stddef.h>
+#include <stdbool.h>
 #include <ctype.h>
 #include <string.h>
 
@@ -8,9 +9,9 @@
 #include <sys/types.h>
 #endif
 
+#include "evhtp/config.h"
 #include "internal.h"
 #include "evhtp/parser.h"
-#include "evhtp/config.h"
 
 #if '\n' != '\x0a' || 'A' != 65
 #error "You have somehow found a non-ASCII host. We can't build here."
@@ -36,6 +37,9 @@ enum parser_flags {
     parser_flag_connection_keep_alive = (1 << 1),
     parser_flag_connection_close      = (1 << 2),
     parser_flag_trailing              = (1 << 3),
+    parser_flag_skip_body             = (1 << 4),
+    parser_flag_transfer_encoding     = (1 << 5),
+    parser_flag_paused                = (1 << 6),
 };
 
 enum parser_state {
@@ -72,7 +76,13 @@ enum parser_state {
     s_hdrline_hdr_val,
     s_hdrline_almost_done,
     s_hdrline_done,
+    s_paused_hdrs,     /* parked after on_hdrs_complete           */
+    s_paused_body,     /* parked mid s_body_read (content-length) */
+    s_paused_chunk,    /* parked mid s_chunk_data (chunked)       */
+    s_paused_identity, /* parked mid s_body_identity (read-to-EOF)*/
     s_body_read,
+    s_body_identity,
+    s_body_identity_eof,
     s_chunk_size_start,
     s_chunk_size,
     s_chunk_size_almost_done,
@@ -448,6 +458,12 @@ htparser_get_status(htparser * p)
     return p->status;
 }
 
+void
+htparser_set_status(htparser * p, unsigned int status)
+{
+    p->status = status;
+}
+
 int
 htparser_should_keep_alive(htparser * p)
 {
@@ -471,6 +487,18 @@ htparser_should_keep_alive(htparser * p)
     return 0;
 }
 
+int
+htparser_is_chunked(htparser * p)
+{
+    return p->flags & parser_flag_chunked;
+}
+
+int
+htparser_uses_transfer_encoding(htparser * p)
+{
+    return p->flags & parser_flag_transfer_encoding;
+}
+
 htp_scheme
 htparser_get_scheme(htparser * p)
 {
@@ -481,6 +509,12 @@ htp_method
 htparser_get_method(htparser * p)
 {
     return p->method;
+}
+
+void
+htparser_set_method(htparser * p, htp_method meth)
+{
+    p->method = meth;
 }
 
 const char *
@@ -542,6 +576,19 @@ htparser_set_userdata(htparser * p, void * ud)
     p->userdata = ud;
 }
 
+/**
+ * htparser_set_skip_body - tell the parser to skip body for this message.
+ *
+ * Must be called after htparser_run() returns for the on_hdrs_complete hook
+ * (i.e. before body data arrives).  Typically used for HEAD responses or
+ * CONNECT tunnels where the server sends headers but no body.
+ */
+void
+htparser_set_skip_body(htparser * p)
+{
+    p->flags |= parser_flag_skip_body;
+}
+
 uint64_t
 htparser_get_content_pending(htparser * p)
 {
@@ -552,6 +599,12 @@ uint64_t
 htparser_get_content_length(htparser * p)
 {
     return p->orig_content_len;
+}
+
+void
+htparser_set_content_length(htparser * p, uint64_t len)
+{
+    p->orig_content_len = len;
 }
 
 uint64_t
@@ -567,15 +620,145 @@ htparser_get_total_bytes_read(htparser * p)
 }
 
 void
+htparser_pause(htparser * p)
+{
+log_debug("(%p)", p);
+    p->flags |= parser_flag_paused;
+}
+
+void
+htparser_resume(htparser * p)
+{
+log_debug("(%p)", p);
+    p->flags &= ~parser_flag_paused;
+}
+
+int
+htparser_is_paused(htparser * p)
+{
+log_debug("(%p)", p);
+    return !!(p->flags & parser_flag_paused);
+}
+
+/*
+ * No Content-Length and no chunked Transfer-Encoding.
+ * For responses this may be an identity (read-until-
+ * connection-close) body.  Detect by checking:
+ *   - parser type is response
+ *   - status code implies a body (not 1xx/204/304)
+ *   - connection is not keep-alive (implicit close)
+ *     OR Connection: close was explicitly set
+ *
+ * Mirroring the logic in nodejs/http-parser.
+ */
+static inline bool
+is_identity_response(htparser * p)
+{
+    return (p->type == htp_type_response
+            && p->status != 0
+            && !(p->status >= 100 && p->status <= 199)
+            && p->status != 204
+            && p->status != 304
+            && !(p->flags & parser_flag_skip_body));
+}
+
+int
+htparser_is_identity_response(htparser * p)
+{
+    return p ? is_identity_response(p) : 0;
+}
+
+/**
+ * htparser_run_eof - signal EOF (connection close) to the parser.
+ *
+ * For identity (read-until-close) responses the body length is unknown until
+ * the underlying connection is closed by the peer.  The caller must invoke
+ * this function after the last htparser_run() call (i.e. when it detects
+ * EOF on the socket) so the parser can fire on_body / on_msg_complete for
+ * any buffered identity-encoded data.
+ *
+ * Returns the number of bytes consumed (always 0 on entry, kept for
+ * symmetry with htparser_run).
+ */
+size_t
+htparser_run_eof(htparser * p, htparse_hooks * hooks)
+{
+    int res = 0;
+
+    p->error      = htparse_error_none;
+    p->bytes_read = 0;
+
+    switch (p->state) {
+        case s_body_identity:
+            /*
+             * We were in the middle of reading an identity body; flush whatever
+             * is pending via on_msg_complete.  (Body bytes were already
+             * delivered incrementally in s_body_identity during htparser_run.)
+             */
+            res      = hook_on_msg_complete_run(p, hooks);
+            p->state = s_start;
+
+            if (res)
+            {
+                p->error = htparse_error_user;
+            }
+
+            break;
+
+        case s_body_identity_eof:
+            /*
+             * Parser was waiting for EOF to confirm end-of-body.  Fire
+             * completion now.
+             */
+            res      = hook_on_msg_complete_run(p, hooks);
+            p->state = s_start;
+
+            if (res)
+            {
+                p->error = htparse_error_user;
+            }
+
+            break;
+
+        default:
+            /* EOF in any other state is a no-op (or a protocol error handled
+             * by the caller). */
+            break;
+    }
+
+    return 0;
+}
+
+static inline void
+init_start_state_ctx(htparser * p)
+{
+    p->flags            = 0;
+    p->error            = htparse_error_none;
+    p->method           = htp_method_UNKNOWN;
+    p->multipart        = 0;
+    p->major            = 0;
+    p->minor            = 0;
+    p->content_len      = 0;
+    p->orig_content_len = 0;
+    p->status           = 0;
+    p->status_count     = 0;
+    p->scheme_offset    = NULL;
+    p->host_offset      = NULL;
+    p->port_offset      = NULL;
+    p->path_offset      = NULL;
+    p->args_offset      = NULL;
+    p->buf_idx          = 0;
+}
+
+void
 htparser_init(htparser * p, htp_type type)
 {
     /* Do not memset entire string buffer. */
     //memset(p, 0, offsetof(htparser, buf));
     p->buf[0] = '\0';
     p->state  = s_start;
-    p->error  = htparse_error_none;
-    p->method = htp_method_UNKNOWN;
     p->type   = type;
+    init_start_state_ctx(p);
 }
 
 htparser *
@@ -709,6 +892,13 @@ get_method(const char * m, const size_t sz)
     return htp_method_UNKNOWN;
 } /* get_method */
 
+htp_method
+htparser_parse_method(htparser * p, const char * m, const size_t sz)
+{
+    p->method  = get_method(m, sz);
+    return p->method;
+}
+
 #define HTP_SET_BUF(CH) do {                                     \
         if (evhtp_likely((p->buf_idx + 1) < PARSER_STACK_MAX)) { \
             p->buf[p->buf_idx++] = CH;                           \
@@ -719,11 +909,119 @@ get_method(const char * m, const size_t sz)
         }                                                        \
 } while (0)
 
+/* ---------------------------------------------------------------
+ * Pre-loop resume handling.
+ * Both pause states must be resolved here so they work correctly
+ * on re-entry with len==0 (zero-body case for s_paused_hdrs) and
+ * with any len for s_paused_msg (body just finished, pipelining).
+ * ---------------------------------------------------------------
+ */
+static inline bool
+handled_resume(htparser * p, htparse_hooks * hooks, size_t len)
+{
+    log_debug("(%p, %p, %zu)", p, hooks, len);
+
+    // p->flags is not yet (re-)initialized, so avoid further checks.
+    if (p->state != s_start)
+    {
+        if (p->flags & parser_flag_paused)
+        {
+            log_debug("paused");
+            return true;   /* still paused, nothing consumed */
+        }
+
+        int res = 0;
+        if (p->state == s_paused_hdrs)
+        {
+            log_debug("s_paused_hdrs");
+            /* Resumed after on_hdrs_complete — route to body or complete */
+            p->buf_idx = 0;
+
+            if (p->flags & parser_flag_trailing)
+            {
+                res      = hook_on_msg_complete_run(p, hooks);
+                p->state = s_start;
+            }
+            else if (p->flags & parser_flag_skip_body)
+            {
+                res      = hook_on_msg_complete_run(p, hooks);
+                p->state = s_start;
+            }
+            else if (p->flags & parser_flag_chunked)
+            {
+                log_debug("chunked");
+                p->state = s_chunk_size_start;
+            }
+            else if (p->content_len > 0)
+            {
+                log_debug("body read");
+                p->state = s_body_read;
+            }
+            else
+            {
+                log_debug("zero len body");
+                /* zero-length body */
+                res      = hook_on_msg_complete_run(p, hooks);
+                p->state = s_start;
+            }
+        }
+        else if (p->state == s_paused_body)
+        {
+            /* Resumed. Check if body was fully consumed before the pause. */
+            if (p->content_len == 0)
+            {
+                /* Async processing finished AND body is complete —
+                * fire msg_complete now, can't rely on for loop to do it
+                * since len may be 0. */
+                res = hook_on_msg_complete_run(p, hooks);
+                p->state = s_start;
+            }
+            else
+            {
+                /* Body not yet fully consumed — more data expected.
+                * Re-enter s_body_read for next chunk (len may be 0
+                * if caller is just resuming with no new data yet). */
+                p->state = s_body_read;
+            }
+        }
+        else if (p->state == s_paused_chunk)
+        {
+            if (p->content_len == 0)
+            {
+                /* chunk fully consumed before pause —
+                * advance to chunk framing (CRLF after chunk data) */
+                p->state = s_chunk_data_almost_done;
+            }
+            else
+            {
+                /* partial chunk consumed — more chunk data expected */
+                p->state = s_chunk_data;
+            }
+            /* fall through into for loop */
+        }
+        else if (p->state == s_paused_identity)
+        {
+            /* No content_len sentinel — just re-enter the read state.
+            * EOF is still signaled externally via htparser_run_eof(). */
+            p->state = s_body_identity;
+        }
+
+        if (res)
+        {
+            log_debug("error user");
+            p->error = htparse_error_user;
+            return true;
+        }
+    }
+    /* fall through into for loop */
+    return false;
+}
 
 size_t
 htparser_run(htparser * p, htparse_hooks * hooks, const char * data, size_t len)
 {
     unsigned char ch;
+    int           res;
     char          c;
     size_t        i;
 
@@ -733,9 +1031,15 @@ htparser_run(htparser * p, htparse_hooks * hooks, const char * data, size_t len)
     p->error      = htparse_error_none;
     p->bytes_read = 0;
 
+    // See if we are resuming a paused parser.
+    if (handled_resume(p, hooks, len))
+    {
+        log_debug("resume handled");
+        return 0;
+    }
+
     for (i = 0; i < len; i++)
     {
-        int res;
         int err;
 
         ch = data[i];
@@ -764,23 +1068,7 @@ htparser_run(htparser * p, htparse_hooks * hooks, const char * data, size_t len)
                     return i + 1;
                 }
 
-
-                p->flags            = 0;
-                p->error            = htparse_error_none;
-                p->method           = htp_method_UNKNOWN;
-                p->multipart        = 0;
-                p->major            = 0;
-                p->minor            = 0;
-                p->content_len      = 0;
-                p->orig_content_len = 0;
-                p->status           = 0;
-                p->status_count     = 0;
-                p->scheme_offset    = NULL;
-                p->host_offset      = NULL;
-                p->port_offset      = NULL;
-                p->path_offset      = NULL;
-                p->args_offset      = NULL;
-                p->buf_idx          = 0;
+                init_start_state_ctx(p);
 
                 res = hook_on_msg_begin_run(p, hooks);
 
@@ -2014,23 +2302,81 @@ hdrline_start:
                             return i + 1;
                         }
 
+                        /* If callback paused us, park here and return.
+                        * Caller must call htparser_resume() then
+                        * htparser_run() with len=0 to continue.
+                        */
+                        if (p->flags & parser_flag_paused) {
+                            log_debug("pausing");
+                            p->state = s_paused_hdrs;
+                            return i + 1;
+                        }
+
                         p->buf_idx = 0;
 
                         if (p->flags & parser_flag_trailing)
                         {
                             res      = hook_on_msg_complete_run(p, hooks);
                             p->state = s_start;
-                        } else if (p->flags & parser_flag_chunked)
+                        }
+                        else if (p->flags & parser_flag_skip_body)
                         {
-                            p->state = s_chunk_size_start;
-                        } else if (p->content_len > 0)
-                        {
-                            p->state = s_body_read;
-                        } else if (p->content_len == 0)
-                        {
+                            /* HEAD response (or similar) — headers only, no body regardless
+                            * of Content-Length or Transfer-Encoding. */
                             res      = hook_on_msg_complete_run(p, hooks);
                             p->state = s_start;
-                        } else {
+                        }
+                        else if (p->flags & parser_flag_chunked)
+                        {
+                            p->state = s_chunk_size_start;
+                        }
+                        else if (p->content_len > 0)
+                        {
+                            p->state = s_body_read;
+                        }
+                        else if (p->content_len == 0)
+                        {
+                            /*
+                             * No Content-Length and no chunked Transfer-Encoding.
+                             * For responses this may be an identity (read-until-
+                             * connection-close) body.  Detect by checking:
+                             *   - parser type is response
+                             *   - status code implies a body (not 1xx/204/304)
+                             *   - connection is not keep-alive (implicit close)
+                             *     OR Connection: close was explicitly set
+                             *
+                             * Mirroring the logic in nodejs/http-parser.
+                             */
+                            if (is_identity_response(p))
+                            {
+                                /*
+                                 * Responses that may carry a body without an
+                                 * explicit length are read until EOF.
+                                 */
+                                if (!htparser_should_keep_alive(p)
+                                    || (p->flags & parser_flag_connection_close))
+                                {
+                                    p->state = s_body_identity_eof;
+                                }
+                                else
+                                {
+                                    /*
+                                     * Keep-alive response with no length and no
+                                     * chunked encoding — treat as zero-length body
+                                     * (message complete).
+                                     */
+                                    res      = hook_on_msg_complete_run(p, hooks);
+                                    p->state = s_start;
+                                }
+                            }
+                            else
+                            {
+                                res      = hook_on_msg_complete_run(p, hooks);
+                                p->state = s_start;
+                            }
+                        }
+                        else
+                        {
                             p->state = s_hdrline_done;
                         }
 
@@ -2062,18 +2408,45 @@ hdrline_start:
                 {
                     res      = hook_on_msg_complete_run(p, hooks);
                     p->state = s_start;
-                } else if (p->flags & parser_flag_chunked)
+                }
+                else if (p->flags & parser_flag_skip_body)
+                {
+                    /* HEAD response (or similar) — headers only, no body regardless
+                    * of Content-Length or Transfer-Encoding. */
+                    res      = hook_on_msg_complete_run(p, hooks);
+                    p->state = s_start;
+                }
+                else if (p->flags & parser_flag_chunked)
                 {
                     p->state = s_chunk_size_start;
                     i--;
-                } else if (p->content_len > 0)
+                }
+                else if (p->content_len > 0)
                 {
                     p->state = s_body_read;
                     i--;
-                } else if (p->content_len == 0)
+                }
+                else if (p->content_len == 0)
                 {
-                    res      = hook_on_msg_complete_run(p, hooks);
-                    p->state = s_start;
+                    if (is_identity_response(p))
+                    {
+                        if (!htparser_should_keep_alive(p)
+                            || (p->flags & parser_flag_connection_close))
+                        {
+                            p->state = s_body_identity_eof;
+                            i--;
+                        }
+                        else
+                        {
+                            res      = hook_on_msg_complete_run(p, hooks);
+                            p->state = s_start;
+                        }
+                    }
+                    else
+                    {
+                        res      = hook_on_msg_complete_run(p, hooks);
+                        p->state = s_start;
+                    }
                 }
 
                 if (res)
@@ -2157,6 +2530,18 @@ hdrline_start:
                         i  += to_read - 1;
                     }
 
+                    if (res)
+                    {
+                        p->error = htparse_error_user;
+                        return i + 1;
+                    }
+
+                    /* pause check — same two cases as s_body_read */
+                    if (p->flags & parser_flag_paused) {
+                        p->state = s_paused_chunk;
+                        return i + 1;
+                    }
+
                     if (to_read == p->content_len)
                     {
                         p->state = s_chunk_data_almost_done;
@@ -2164,13 +2549,6 @@ hdrline_start:
 
                     p->content_len -= to_read;
                 }
-
-                if (res)
-                {
-                    p->error = htparse_error_user;
-                    return i + 1;
-                }
-
                 break;
 
             case s_chunk_data_almost_done:
@@ -2201,6 +2579,70 @@ hdrline_start:
 
                 break;
 
+            case s_body_identity:
+                /*
+                 * Identity encoding: read all available data until EOF.
+                 * Body bytes are delivered to the caller via on_body; the
+                 * message is only complete when htparser_run_eof() is called.
+                 */
+                res = 0;
+
+                {
+                    const char * pp      = &data[i];
+                    const char * pe      = (const char *)(data + len);
+                    size_t       to_read = (size_t)(pe - pp);
+
+                    if (to_read > 0) {
+                        res = hook_body_run(p, hooks, pp, to_read);
+                        i  += to_read - 1;
+                        p->total_bytes_read += to_read - 1; /* compensate loop incr */
+                        p->bytes_read       += to_read - 1;
+                    }
+
+                    if (res) {
+                        p->error = htparse_error_user;
+                        return i + 1;
+                    }
+
+                    if (p->flags & parser_flag_paused) {
+                        log_debug("paused");
+                        p->state = s_paused_identity;
+                        return i + 1;
+                    }
+                }
+
+                break;
+
+            case s_body_identity_eof:
+                /*
+                 * Waiting for EOF to confirm end-of-body.  Same as
+                 * s_body_identity but we enter this state at header-complete
+                 * time (before any body bytes arrive) rather than mid-stream.
+                 * Transition to s_body_identity once we see the first byte.
+                 */
+                res = 0;
+
+                {
+                    const char * pp      = &data[i];
+                    const char * pe      = (const char *)(data + len);
+                    size_t       to_read = (size_t)(pe - pp);
+
+                    if (to_read > 0) {
+                        p->state = s_body_identity;
+                        res      = hook_body_run(p, hooks, pp, to_read);
+                        i       += to_read - 1;
+                        p->total_bytes_read += to_read - 1;
+                        p->bytes_read       += to_read - 1;
+                    }
+
+                    if (res) {
+                        p->error = htparse_error_user;
+                        return i + 1;
+                    }
+                }
+
+                break;
+
             case s_body_read:
                 res = 0;
 
@@ -2218,6 +2660,14 @@ hdrline_start:
 
                     if (res) {
                         p->error = htparse_error_user;
+                        return i + 1;
+                    }
+
+                    /* Backpressure — body consumer called htparser_pause().
+                    * Park here; caller resumes with remaining buffered data.
+                    */
+                    if (p->flags & parser_flag_paused) {
+                        p->state = s_paused_body;
                         return i + 1;
                     }
 

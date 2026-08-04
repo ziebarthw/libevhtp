@@ -120,6 +120,22 @@ EVHTP_EXPORT void         * htparser_get_userdata(htparser *);
 EVHTP_EXPORT void           htparser_set_userdata(htparser *, void *);
 EVHTP_EXPORT void           htparser_init(htparser *, htp_type);
 EVHTP_EXPORT htparser     * htparser_new(void);
+EVHTP_EXPORT size_t         htparser_run_eof(htparser *, htparse_hooks *);
+EVHTP_EXPORT void           htparser_set_skip_body(htparser *);
+
+EVHTP_EXPORT int            htparser_is_chunked(htparser *);
+EVHTP_EXPORT int            htparser_uses_transfer_encoding(htparser *);
+EVHTP_EXPORT uint64_t       htparser_get_bytes_read(htparser *);
+
+EVHTP_EXPORT void           htparser_pause(htparser *);
+EVHTP_EXPORT void           htparser_resume(htparser *);
+EVHTP_EXPORT int            htparser_is_paused(htparser *);
+
+EVHTP_EXPORT void           htparser_set_method(htparser *, htp_method);
+EVHTP_EXPORT htp_method     htparser_parse_method(htparser *, const char *, const size_t);
+EVHTP_EXPORT void           htparser_set_content_length(htparser *, uint64_t);
+EVHTP_EXPORT int            htparser_is_identity_response(htparser *);
+EVHTP_EXPORT void           htparser_set_status(htparser *, unsigned int);
 
 #ifdef __cplusplus
 }

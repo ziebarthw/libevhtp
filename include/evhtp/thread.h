@@ -31,9 +31,11 @@ typedef struct evthr_pool evthr_pool_t;
 typedef struct evthr      evthr_t;
 typedef enum evthr_res    evthr_res;
 
-typedef void (* evthr_cb)(evthr_t * thr, void * cmd_arg, void * shared);
-typedef void (* evthr_init_cb)(evthr_t * thr, void * shared);
-typedef void (* evthr_exit_cb)(evthr_t * thr, void * shared);
+typedef void   (* evthr_cb)(evthr_t * thr, void * cmd_arg, void * shared);
+typedef void * (* evthr_eval_cb)(evthr_t * thr, void * cmd_arg, void * shared);
+//typedef void * (* evthr_recv_cb)(evthr_t * thr, void * cmd_arg, void * shared);
+typedef void   (* evthr_init_cb)(evthr_t * thr, void * shared);
+typedef void   (* evthr_exit_cb)(evthr_t * thr, void * shared);
 
 EVHTP_EXPORT evthr_t * evthr_new(evthr_init_cb, void *)
     DEPRECATED("will take on the syntax of evthr_wexit_new");
@@ -52,6 +54,9 @@ EVHTP_EXPORT evthr_pool_t * evthr_pool_new(int nthreads, evthr_init_cb, void *)
 EVHTP_EXPORT int            evthr_pool_start(evthr_pool_t * pool);
 EVHTP_EXPORT evthr_res      evthr_pool_stop(evthr_pool_t * pool);
 EVHTP_EXPORT evthr_res      evthr_pool_defer(evthr_pool_t * pool, evthr_cb cb, void * arg);
+EVHTP_EXPORT evthr_res      evthr_pool_defer_all(evthr_pool_t * pool, evthr_cb cb, void * arg);
+EVHTP_EXPORT evthr_res      evthr_pool_defer_all_sync(evthr_pool_t * pool, evthr_cb cb, void * arg);
+EVHTP_EXPORT evthr_res      evthr_pool_defer_all_completed(evthr_pool_t * pool, evthr_eval_cb cb, void * arg, evthr_cb complete_cb);
 EVHTP_EXPORT void           evthr_pool_free(evthr_pool_t * pool);
 
 EVHTP_EXPORT evthr_t      * evthr_wexit_new(evthr_init_cb, evthr_exit_cb, void * shared);

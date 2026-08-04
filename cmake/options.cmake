@@ -1,6 +1,9 @@
 # -DEVHTP_DISABLE_SSL=ON
 option (EVHTP_DISABLE_SSL   "Disable ssl support"          OFF)
 
+# -DEVHTP_DISABLE_H2=ON
+option(EVHTP_DISABLE_H2 "Disable HTTP/2 support via nghttp2" OFF)
+
 # -DEVHTP_DISABLE_EVTHR=ON
 option (EVHTP_DISABLE_EVTHR "Disable evthread support"     OFF)
 
