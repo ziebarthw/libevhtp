@@ -1466,6 +1466,11 @@ EVHTP_EXPORT evhtp_connection_t * evhtp_connection_ssl_new(
  * @brief allocate a new request
  */
 EVHTP_EXPORT evhtp_request_t * evhtp_request_new(evhtp_callback_cb cb, void * arg);
+
+/**
+ * @brief allocate a new request, reusing a cached evhtp_request_t object from
+ *        |evhtp| (if available).
+ */
 EVHTP_EXPORT evhtp_request_t * evhtp_request_new_(evhtp_t * evhtp, evhtp_callback_cb cb, void * arg);
 
 /**
