@@ -19,6 +19,7 @@
 * [OpenSSL](http://openssl.org)
 * pthreads
 * [onig (regex)](https://github.com/kkos/oniguruma)
+* [nghttp2 (http/2)](https://github.com/nghttp2/nghttp2)
 
 ## Building
 * cd build
