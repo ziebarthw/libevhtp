@@ -790,3 +790,10 @@ evthr_pool_start(evthr_pool_t * pool)
 
     return 0;
 }
+
+int
+evthr_pool_get_nthreads(evthr_pool_t * pool)
+{
+    log_debug("(%p)", pool);
+    return pool ? pool->nthreads : 0;
+}
