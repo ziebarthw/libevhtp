@@ -622,21 +622,18 @@ htparser_get_total_bytes_read(htparser * p)
 void
 htparser_pause(htparser * p)
 {
-log_debug("(%p)", p);
     p->flags |= parser_flag_paused;
 }
 
 void
 htparser_resume(htparser * p)
 {
-log_debug("(%p)", p);
     p->flags &= ~parser_flag_paused;
 }
 
 int
 htparser_is_paused(htparser * p)
 {
-log_debug("(%p)", p);
     return !!(p->flags & parser_flag_paused);
 }
 

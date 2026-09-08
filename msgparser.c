@@ -135,17 +135,18 @@ struct htparser {
     unsigned char major;
     unsigned char minor;
 
-    bool have_host : 1;
-    bool have_content_length : 1;
-    bool have_content_type : 1;
-    bool have_transfer_encoding : 1;
-    bool have_connection : 1;
-    bool is_chunked : 1;
-    bool is_multipart : 1;
-    bool connection_keep_alive : 1;
-    bool connection_close : 1;
-    bool skip_body : 1;
-    bool paused : 1;
+    #define HAVE_HOST              (1 << 0)
+    #define HAVE_CONTENT_LENTH     (1 << 1)
+    #define HAVE_CONTENT_TYPE      (1 << 2)
+    #define HAVE_TRANSFER_ENCODING (1 << 3)
+    #define HAVE_CONNECTION        (1 << 4)
+    #define IS_CHUNKED             (1 << 5)
+    #define IS_MUTLIPART           (1 << 6)
+    #define CONNECTION_KEEP_ALIVE  (1 << 7)
+    #define CONNECTION_CLOSE       (1 << 8)
+    #define SKIP_BODY              (1 << 9)
+    #define PAUSED                 (1 << 10)
+    uint16_t flags;
 };
 
 static htp_http1config_t default_config = {
@@ -282,16 +283,10 @@ htparser_reset(htparser * self)
     log_debug("(%p)", self);
     if (self)
     {
+        htp_type type = self->type;
         self->state = PARSER_START;
         self->error = htparse_error_none;
-        self->have_connection = false;
-        self->have_content_length = false;
-        self->have_content_type = false;
-        self->have_host = false;
-        self->have_transfer_encoding = false;
-        self->is_chunked = false;
-        self->connection_close = false;
-        self->connection_keep_alive = false;
+        self->flags = 0;
         self->content_len = 0;
         self->orig_content_len = 0;
         self->empty_line_count = 0;
@@ -981,16 +976,16 @@ consume_header(htparser * self, const htp_string_t * key, const htp_string_t * v
         return false;
     }
 
-    if (!self->have_host && MATCHES_NAME(key, host_name))
+    if (!(self->flags & HAVE_HOST) && MATCHES_NAME(key, host_name))
     {
         if (hook_hostname_run(self, self->hooks, val->startp, val->len))
         {
             self->error = htparse_error_user;
             return false;
         }
-        self->have_host = true;
+        self->flags |= HAVE_HOST;
     }
-    else if (!self->have_content_length && MATCHES_NAME(key, content_length))
+    else if (!(self->flags & HAVE_CONTENT_LENTH) && MATCHES_NAME(key, content_length))
     {
         int err = 0;
         self->content_len = str_to_uint64(val->startp, val->len, &err);
@@ -1000,9 +995,9 @@ consume_header(htparser * self, const htp_string_t * key, const htp_string_t * v
             return false;
         }
         self->orig_content_len = self->content_len;
-        self->have_content_length = true;
+        self->flags |= HAVE_CONTENT_LENTH;
     }
-    else if (!self->have_content_type && MATCHES_NAME(key, content_type))
+    else if (!(self->flags & HAVE_CONTENT_TYPE) && MATCHES_NAME(key, content_type))
     {
         htp_string_t s = *val;
         const char * curp = memchr(s.startp, '/', s.len);
@@ -1011,19 +1006,19 @@ consume_header(htparser * self, const htp_string_t * key, const htp_string_t * v
             log_debug("found slash");
             s.len = curp - s.startp;
         }
-        self->is_multipart = MATCHES_NAME(&s, multipart);
+        if (MATCHES_NAME(&s, multipart)) self->flags |= IS_MUTLIPART;
     }
-    else if (!self->have_transfer_encoding && MATCHES_NAME(key, transfer_encoding))
+    else if (!(self->flags & HAVE_TRANSFER_ENCODING) && MATCHES_NAME(key, transfer_encoding))
     {
-        self->is_chunked = MATCHES_NAME(val, chunked);
-        self->have_transfer_encoding = true;
+        if (MATCHES_NAME(val, chunked)) self->flags |= IS_CHUNKED;
+        self->flags |= HAVE_TRANSFER_ENCODING;
     }
-    else if (!self->have_connection && MATCHES_NAME(key, connection))
+    else if (!(self->flags & HAVE_CONNECTION) && MATCHES_NAME(key, connection))
     {
         if (MATCHES_NAME(val, close))
-            self->connection_close = true;
+            self->flags |= CONNECTION_CLOSE;
         else if (MATCHES_NAME(val, keep_alive))
-            self->connection_keep_alive = true;
+            self->flags |= CONNECTION_KEEP_ALIVE;
     }
 
     if (hook_hdr_val_run(self, self->hooks, val->startp, val->len))
@@ -1344,18 +1339,11 @@ is_identity(htparser * self)
         log_debug("keep-alive conn");
         return false;
     }
-    if (!(self->major == '1' && self->minor == '0'))
+    if (!(self->major == 1 && self->minor == 0))
     {
         log_debug("not 1.0");
         return false;
     }
-#if 0
-    if (self->connection_keep_alive)
-    {
-        log_debug("keep alive");
-        return false;
-    }
-#endif
     return true;
 }
 
@@ -1370,7 +1358,7 @@ self->state = PARSER_COMPLETED;
 return;
 #endif
 
-    if (self->is_chunked)
+    if (self->flags & IS_CHUNKED)
     {
         self->decoder.parse_data = parse_chunked;
         chunked_decoder_init(&self->decoder.chunked_decoder);
@@ -1537,8 +1525,8 @@ htparser_should_keep_alive(htparser * self)
 {
     log_debug("(%p)", self);
     return self &&
-            self->connection_keep_alive ||
-            ((self->major > 0 && self->minor > 0) && !self->connection_close);
+            (self->flags & CONNECTION_KEEP_ALIVE) ||
+                ((self->major > 0 && self->minor > 0) && !(self->flags & CONNECTION_CLOSE));
 }
 
 void *
@@ -1610,7 +1598,7 @@ htparser_set_content_length(htparser * p, uint64_t len)
 int
 htparser_is_chunked(htparser * p)
 {
-    return p ? p->is_chunked : false;
+    return p ? !!(p->flags & IS_CHUNKED) : 0;
 }
 
 /*
@@ -1632,7 +1620,7 @@ is_identity_response(htparser * p)
             && !(p->head_line.status_line.status_code >= 100 && p->head_line.status_line.status_code <= 199)
             && p->head_line.status_line.status_code != 204
             && p->head_line.status_line.status_code != 304
-            && !p->skip_body);
+            && !(p->flags & SKIP_BODY));
 }
 
 int
@@ -1668,7 +1656,7 @@ htparser_get_minor(htparser * p)
 unsigned char
 htparser_get_multipart(htparser * p)
 {
-    return p ? p->is_multipart : false;
+    return p ? !!(p->flags & IS_MUTLIPART) : 0;
 }
 
 htpparse_error
@@ -1705,22 +1693,19 @@ htparser_set_status(htparser * p, unsigned int status)
 void
 htparser_pause(htparser * p)
 {
-log_debug("(%p)", p);
-    if (p) p->paused = true;
+    if (p) p->flags |= PAUSED;
 }
 
 void
 htparser_resume(htparser * p)
 {
-log_debug("(%p)", p);
-    if (p) p->paused = false;
+    if (p) p->flags &= ~PAUSED;
 }
 
 int
 htparser_is_paused(htparser * p)
 {
-log_debug("(%p)", p);
-    return p ? !!(p->paused) : 0;
+    return p ? !!(p->flags & PAUSED) : 0;
 }
 
 /**
@@ -1733,7 +1718,7 @@ log_debug("(%p)", p);
 void
 htparser_set_skip_body(htparser * p)
 {
-    if (p) p->skip_body = true;
+    if (p) p->flags |= SKIP_BODY;
 }
 
 htp_method
@@ -2052,7 +2037,7 @@ test_request_parsing(htparser * parser)
 #else
 
     FILE * fp = fopen("/home/parallels/projects/RProxy-htm8/tmp/requests_only.log", "rt");
-    char buf[parser->config.max_line_length * 2];
+    char buf[parser->config->max_line_length * 2];
     size_t bufsize = sizeof(buf);
     char * bufp = buf;
     char * readp = buf;
