@@ -51,7 +51,8 @@ check_c_compiler_flag(-fstack-protector-strong has_stack_protector)
 set(LIBEVHTP_SOURCE_FILES
     evhtp.c
     numtoa.c
-    parser.c
+    msgparser.c
+    parsed_uri.c
     log.c)
 
 find_package(LibEvent REQUIRED)
@@ -62,6 +63,8 @@ list(APPEND package_deps LibEvent)
 set(evhtp_dir_headers
   "include/evhtp/evhtp.h"
   "include/evhtp/parser.h"
+  "include/evhtp/msgparser.h"
+  "include/evhtp/parsed_uri.h"
   "include/evhtp/log.h")
 
 if(NOT EVHTP_DISABLE_SSL)

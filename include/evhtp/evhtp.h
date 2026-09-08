@@ -12,7 +12,11 @@
 #include <evhtp/thread.h>
 #endif
 
+#ifndef EVHTP_DISABLE_MSGPARSER
+#include <evhtp/msgparser.h>
+#else
 #include <evhtp/parser.h>
+#endif
 
 #ifndef EVHTP_DISABLE_REGEX
 #include <onigposix.h>

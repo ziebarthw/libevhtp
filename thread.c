@@ -44,6 +44,13 @@
 #define IF_SEND_MSG(x, ...)
 #endif
 
+//#define WITH_HEAD
+#ifdef WITH_HEAD
+#define IF_HEAD(x, ...) x##__VA_ARGS__
+#else
+#define IF_HEAD(x, ...)
+#endif
+
 static __thread evthr_t * tls_thread;
 
 typedef struct evthr_cmd        evthr_cmd_t;
@@ -93,8 +100,8 @@ IF_SEND_MSG(pthread_cond_t  cond;)
 
     _Atomic size_t tail; // Enqueued count (read-only for producers)
     /* NOTE: currently head isn't used; could be used for debug or stats. */
-    _Atomic size_t head; // Dequeued count (consumer updates)
-    alignas(CACHE_LINE_SIZE) char padding[CACHE_LINE_SIZE];
+IF_HEAD(_Atomic size_t head;) // Dequeued count (consumer updates)
+    alignas(CACHE_LINE_SIZE) char padding[CACHE_LINE_SIZE - sizeof(size_t) IF_HEAD(* 2)];
 };
 
 static void
@@ -113,7 +120,6 @@ _evthr_run_callbacks(void *args)
         evthr_cmd_t *cmd = (evthr_cmd_t *)node;
         struct producer_q* pq = cmd->msg_cache_p;
         cmd->cb(thread, cmd->args, thread->arg);
-        atomic_fetch_add_explicit(&thread->head, 1, memory_order_relaxed);
         if (!pq)
         {
             free(cmd);
@@ -124,6 +130,7 @@ _evthr_run_callbacks(void *args)
             free(cmd);
         }
         IF_COUNTERS(++thread->msg_count;)
+        IF_HEAD(atomic_fetch_add_explicit(&thread->head, 1, memory_order_relaxed);)
     }
 }
 
@@ -160,12 +167,13 @@ static void *
 _evthr_loop(void * args)
 {
     evthr_t * thread = args;
+    evthr_t * sender = tls_thread;
 
     if (thread == NULL || thread->thr == NULL) {
         pthread_exit(NULL);
     }
 
-    tls_thread = thread;
+    if (!sender) tls_thread = thread;
 
     thread->evbase = event_base_new();
     thread->msg_event = event_new(thread->evbase, thread->msg_fd,
@@ -192,7 +200,7 @@ _evthr_loop(void * args)
 
     pthread_mutex_unlock(&thread->lock);
 
-    tls_thread = NULL;
+    if (!sender) tls_thread = NULL;
 
     pthread_exit(NULL);
 } /* _evthr_loop */
@@ -796,4 +804,14 @@ evthr_pool_get_nthreads(evthr_pool_t * pool)
 {
     log_debug("(%p)", pool);
     return pool ? pool->nthreads : 0;
+}
+
+void
+evthr_pool_cleanup(void)
+{
+    log_debug("()");
+    if (tls_thread) {
+        evthr_free(tls_thread);
+        tls_thread = NULL;
+    }
 }

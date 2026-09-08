@@ -1267,7 +1267,6 @@ htp__uri_clear_(evhtp_uri_t * uri)
 static void
 htp__uri_free_(evhtp_uri_t * uri)
 {
-log_debug("(%p)", uri);
     if (evhtp_unlikely(uri == NULL)) {
         return;
     }
@@ -1358,7 +1357,6 @@ htp__request_free_(evhtp_request_t * request)
     if (request == NULL) {
         return;
     }
-log_debug("(%p)", request);
 
     htp__hook_request_fini_(request);
 
@@ -1391,8 +1389,6 @@ log_debug("(%p)", request);
         htp__unlock_(htp);
         return;
     }
-
-log_debug("freeing request %p", request);
 
     evhtp_safe_free(request->uri, htp__uri_free_);
     evhtp_safe_free(request->headers_in, evhtp_kvs_free);
@@ -1457,7 +1453,6 @@ htp__request_new_(evhtp_connection_t * c)
     } while (0);
 
     if (error == 0) {
-log_debug("req %p, %zu bytes", req, sizeof(*req));
         return req;
     }
 
@@ -1735,7 +1730,6 @@ htp__request_find_vhost_(evhtp_t * evhtp, const char * name, size_t len)
         }
     }
 
-log_debug("not found");
     return NULL;
 }
 
@@ -3819,23 +3813,31 @@ evhtp_kvs_for_each(evhtp_kvs_t * kvs, evhtp_kvs_iterator cb, void * arg)
     return 0;
 }
 
-#define TOLOWER(c) (char)((unsigned char)(c) | 0x20)
+static inline int
+match_header_key(evhtp_kv_t * kv, const char * key, size_t len)
+{
+#   define TOLOWER(c) (char)((unsigned char)(c) | 0x20)
+
+    if (kv->klen != len) {
+        return 0;
+    }
+    for (size_t i = 0; i < len; i++) {
+        if (TOLOWER(kv->key[i]) != TOLOWER(key[i])) {
+            return 0;
+        }
+    }
+    return 1;
+
+#   undef TOLOWER
+}
 
 static inline const char *
 evhtp_kv_find_n_(evhtp_kvs_t * kvs, const char * key, size_t len)
 {
     evhtp_kv_t * kv;
 
-    if (evhtp_unlikely(kvs == NULL || key == NULL)) {
-        return NULL;
-    }
-
-    char c = TOLOWER(key[0]);
-
     TAILQ_FOREACH(kv, kvs, next) {
-        if (kv->klen == len &&
-            TOLOWER(kv->key[0]) == c &&
-            strcasecmp(kv->key, key) == 0) {
+        if (match_header_key(kv, key, len)) {
             return kv->val;
         }
     }
@@ -3950,20 +3952,14 @@ evhtp_kvs_find_kv_n_(evhtp_kvs_t * kvs, const char * key, size_t len)
 {
     evhtp_kv_t * kv;
 
-    char c = TOLOWER(key[0]);
-
     TAILQ_FOREACH(kv, kvs, next) {
-        if (kv->klen == len &&
-            TOLOWER(kv->key[0]) == c &&
-            strcasecmp(kv->key, key) == 0) {
+        if (match_header_key(kv, key, len)) {
             return kv;
         }
     }
 
     return NULL;
 }
-
-#undef TOLOWER
 
 evhtp_kv_t *
 evhtp_kvs_find_kv(evhtp_kvs_t * kvs, const char * key)
@@ -6665,7 +6661,7 @@ evhtp_connection_free(evhtp_connection_t * connection)
 #endif
 
     evhtp_safe_free(connection->request, htp__request_free_);
-    evhtp_safe_free(connection->parser, htp__free_);
+    evhtp_safe_free(connection->parser, htparser_free);
     evhtp_safe_free(connection->hooks, htp__free_);
     evhtp_safe_free(connection->saddr, htp__free_);
     evhtp_safe_free(connection->scratch_buf, evbuffer_free);

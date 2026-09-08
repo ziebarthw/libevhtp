@@ -59,6 +59,7 @@ EVHTP_EXPORT evthr_res      evthr_pool_defer_all_sync(evthr_pool_t * pool, evthr
 EVHTP_EXPORT evthr_res      evthr_pool_defer_all_completed(evthr_pool_t * pool, evthr_eval_cb cb, void * arg, evthr_cb complete_cb);
 EVHTP_EXPORT void           evthr_pool_free(evthr_pool_t * pool);
 EVHTP_EXPORT int            evthr_pool_get_nthreads(evthr_pool_t * pool);
+EVHTP_EXPORT void           evthr_pool_cleanup(void);
 
 EVHTP_EXPORT evthr_t      * evthr_wexit_new(evthr_init_cb, evthr_exit_cb, void * shared);
 EVHTP_EXPORT evthr_pool_t * evthr_pool_wexit_new(int nthreads, evthr_init_cb, evthr_exit_cb, void *);

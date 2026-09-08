@@ -767,6 +767,14 @@ htparser_new(void)
     return malloc(sizeof(htparser));
 }
 
+void
+htparser_free(htparser * p)
+{
+    if (p) {
+        free(p);
+    }
+}
+
 static int
 is_host_char(unsigned char ch)
 {
@@ -1462,6 +1470,7 @@ htparser_run(htparser * p, htparse_hooks * hooks, const char * data, size_t len)
                     {
                         int r1 = hook_path_run(p, hooks, p->path_offset,
                                                (&p->buf[p->buf_idx] - p->path_offset));
+log_debug("calling hook_uri_run()");
                         int r2 = hook_uri_run(p, hooks, p->buf, p->buf_idx);
 
                         p->state   = s_http_09;
@@ -1524,14 +1533,17 @@ htparser_run(htparser * p, htparse_hooks * hooks, const char * data, size_t len)
                     if (usual[ch >> 5] & (1 << (ch & 0x1f))) {
                         HTP_SET_BUF(ch);
                     } else {
+log_debug("breaking");
                         break;
                     }
 
                     if (evhtp_unlikely(i + 1 >= len)) {
+log_debug("breaking");
                         break;
                     }
 
                     ch = data[++i];
+log_debug("data[%zu] = '%c'", i, data[i]);
                 } while (i < len);
 
                 switch (ch) {
@@ -1549,6 +1561,7 @@ htparser_run(htparser * p, htparse_hooks * hooks, const char * data, size_t len)
                                                (&p->buf[p->buf_idx] - p->path_offset));
                         }
 
+log_debug("calling hook_uri_run()");
                         r2         = hook_uri_run(p, hooks, p->buf, p->buf_idx);
                         p->buf_idx = 0;
                         p->state   = s_http_09;
@@ -2702,3 +2715,426 @@ hdrline_start:
 
     return i;
 }         /* htparser_run */
+
+//#define WITH_HTPARSER_TEST
+#ifdef WITH_HTPARSER_TEST
+static int
+htp__request_parse_start_(htparser * p)
+{
+    log_debug("(%p)", p);
+    return 0;
+}
+
+static int
+htp__request_parse_scheme_(htparser * p, const char * data, size_t len)
+{
+    log_debug("(%p, %p(%.*s), %zu)", p, data, (int)len, data, len);
+    return 0;
+}
+
+static int
+htp__request_parse_host_(htparser * p, const char * data, size_t len)
+{
+    log_debug("(%p, %p(%.*s), %zu)", p, data, (int)len, data, len);
+    return 0;
+}
+
+static int
+htp__request_parse_port_(htparser * p, const char * data, size_t len)
+{
+    log_debug("(%p, %p(%.*s), %zu)", p, data, (int)len, data, len);
+    return 0;
+}
+
+static int
+htp__request_parse_path_(htparser * p, const char * data, size_t len)
+{
+    log_debug("(%p, %p(%.*s), %zu)", p, data, (int)len, data, len);
+    return 0;
+}     /* htp__request_parse_path_ */
+
+static int
+htp__request_parse_args_(htparser * p, const char * data, size_t len)
+{
+    log_debug("(%p, %p(%.*s), %zu)", p, data, (int)len, data, len);
+    return 0;
+}     /* htp__request_parse_args_ */
+
+static int
+htp__request_parse_uri_(htparser * p, const char * data, size_t len)
+{
+    log_debug("(%p, %p(%.*s), %zu)", p, data, (int)len, data, len);
+    return 0;
+}     /* htp__request_parse_uri_ */
+
+static int
+htp__request_parse_method_(htparser * p, const char * data, size_t len)
+{
+    log_debug("(%p, %p(%.*s), %zu)", p, data, (int)len, data, len);
+    return 0;
+}
+
+static int
+htp__request_parse_headers_start_(htparser * p)
+{
+    log_debug("(%p)", p);
+
+//    log_debug("\"%s\" \"%.*s\" HTTP/%d.%d", htparser_get_methodstr_m(p->method), (int)p->uri.len, r->uri.startp, p->major, p->minor);
+    return 0;
+}
+
+static int
+htp__response_parse_headers_start_(htparser * p)
+{
+    log_debug("(%p)", p);
+
+//    status_line_t * s = &p->head_line.status_line;
+//    log_debug("HTTP/%d.%d %d \"%.*s\"", p->major, p->minor, s->status_code, (int)s->status_text.len, s->status_text.startp);
+    return 0;
+}
+
+static int
+htp__request_parse_header_key_(htparser * p, const char * data, size_t len)
+{
+    log_debug("(%p, %p(%.*s), %zu)", p, data, (int)len, data, len);
+    return 0;
+}
+
+static int
+htp__request_parse_header_val_(htparser * p, const char * data, size_t len)
+{
+    log_debug("(%p, %p(%.*s), %zu)", p, data, (int)len, data, len);
+    return 0;
+}
+
+static int
+htp__request_parse_headers_(htparser * p)
+{
+    log_debug("(%p)", p);
+    return 0;
+}
+
+static int
+htp__request_parse_hostname_(htparser * p, const char * data, size_t len)
+{
+    log_debug("(%p, %p(%.*s), %zu)", p, data, (int)len, data, len);
+    return 0;
+} /* htp__request_parse_hostname_ */
+
+static int
+htp__request_parse_body_(htparser * p, const char * data, size_t len)
+{
+    log_debug("(%p, %p(%.*s), %zu)", p, data, (int)len, data, len);
+    return 0;
+}
+
+static int
+htp__request_parse_chunk_new_(htparser * p)
+{
+    log_debug("(%p)", p);
+    return 0;
+}
+
+static int
+htp__request_parse_chunk_fini_(htparser * p)
+{
+    log_debug("(%p)", p);
+    return 0;
+}
+
+static int
+htp__request_parse_chunks_fini_(htparser * p)
+{
+    log_debug("(%p)", p);
+    return 0;
+}
+
+static long num_parsed = 0L;
+
+static int
+htp__request_parse_fini_(htparser * p)
+{
+++num_parsed;
+    log_debug("(%p) %ld", p, num_parsed);
+    return 0;
+} /* htp__request_parse_fini_ */
+
+static struct htparse_hooks request_psets = {
+    .on_msg_begin       = htp__request_parse_start_,
+    .method             = htp__request_parse_method_,
+    .scheme             = htp__request_parse_scheme_,
+    .host               = htp__request_parse_host_,
+    .port               = htp__request_parse_port_,
+    .path               = htp__request_parse_path_,
+    .args               = htp__request_parse_args_,
+    .uri                = htp__request_parse_uri_,
+    .on_hdrs_begin      = htp__request_parse_headers_start_,
+    .hdr_key            = htp__request_parse_header_key_,
+    .hdr_val            = htp__request_parse_header_val_,
+    .hostname           = htp__request_parse_hostname_,
+    .on_hdrs_complete   = htp__request_parse_headers_,
+    .on_new_chunk       = htp__request_parse_chunk_new_,
+    .on_chunk_complete  = htp__request_parse_chunk_fini_,
+    .on_chunks_complete = htp__request_parse_chunks_fini_,
+    .body               = htp__request_parse_body_,
+    .on_msg_complete    = htp__request_parse_fini_
+};
+static struct htparse_hooks response_psets = {
+    .on_msg_begin       = htp__request_parse_start_,
+    .method             = NULL,
+    .scheme             = NULL,
+    .host               = NULL,
+    .port               = NULL,
+    .path               = NULL,
+    .args               = NULL,
+    .uri                = NULL,
+    .on_hdrs_begin      = htp__response_parse_headers_start_,
+    .hdr_key            = htp__request_parse_header_key_,
+    .hdr_val            = htp__request_parse_header_val_,
+    .hostname           = htp__request_parse_hostname_,
+    .on_hdrs_complete   = htp__request_parse_headers_,
+    .on_new_chunk       = htp__request_parse_chunk_new_,
+    .on_chunk_complete  = htp__request_parse_chunk_fini_,
+    .on_chunks_complete = htp__request_parse_chunks_fini_,
+    .body               = htp__request_parse_body_,
+    .on_msg_complete    = htp__request_parse_fini_
+};
+
+#define TO_MSECS(u) ((u) / 1000)
+#define TO_SECS(u) (TO_MSECS(u) / 1000)
+
+#include <time.h>
+static int64_t
+get_monotonic_time_usec(void)
+{
+    struct timespec ts;
+
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0)
+    {
+        return -1; /* or handle error as appropriate */
+    }
+
+    return (int64_t)ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
+}
+
+static void
+test_request_parsing(htparser * parser)
+{
+    log_debug("(%p)", parser);
+#if 0
+    static const char msg[] =
+        "POST /test-chunked-php/abc?abc=123 HTTP/1.1\r\n"
+        "Content-type: text/plain\r\n"
+        "Transfer-encoding: chunked\r\n"
+        "\r\n"
+        "7\r\n"
+        "Welcome\r\n"
+        "1c\r\n"
+        "to Mozilla Developer Network\r\n"
+        "0\r\n"
+        "\r\n"
+        "POST /this/is/the/path?this=is&the=query HTTP/1.1\r\n"
+        "Host: www.thehost.com\r\n"
+        "Content-length: 10\r\n"
+        "\r\n"
+        "12345=6789"
+        "GET http://www.thehost.com:8080/images/test-image.gif?abc=123 HTTP/1.1\r\n"
+        "Host: www.thehost.com\r\n"
+        "\r\n"
+        "GET /images/test-image-2.gif HTTP/1.1\r\n"
+        "Host: www.thehost.com\r\n"
+        "Accept: image/gif\r\n"
+        "\r\n"
+    ;
+    const char * curp = msg;
+    size_t len = sizeof(msg) - 1;
+    size_t avail = /*10*/len;
+    msgparser_init(parser, htp_type_request);
+    while (len > 0)
+    {
+        size_t nread = msgparser_run(parser, &request_psets, curp, avail);
+        log_debug("read %zu of %zu bytes", nread, avail);
+        if (parser->error != htparse_error_none)
+        {
+            log_debug("failed");
+            break;
+        }
+//        avail -= nread;
+len -= nread;
+        curp += nread;
+avail += 10;
+if (avail > len) avail = len;
+    }
+#endif//0
+
+    FILE * fp = fopen("/home/parallels/projects/RProxy-htm8/tmp/requests_only.log", "rt");
+    char buf[8192];
+    char * bufp = buf;
+    char * readp = buf;
+    char * endp = buf + sizeof(buf);
+    size_t buflen = sizeof(buf);
+    size_t nbytes;
+bool error_flag = false;
+int64_t start_us = get_monotonic_time_usec();
+    while (!error_flag && (nbytes = fread(bufp, 1, buflen, fp)) > 0)
+    {
+//log_debug("nbytes %zu\n\"%.*s\"", nbytes, (int)nbytes, buf);
+        size_t bytes_buffered = bufp - buf;
+        bufp = buf;
+        nbytes += bytes_buffered;
+        while (nbytes > 0)
+        {
+            size_t nread = htparser_run(parser, &request_psets, bufp, nbytes);
+            log_debug("read %zu of %zu bytes", nread, nbytes);
+            if (parser->error != htparse_error_none)
+            {
+                log_debug("failed");
+                break;
+            }
+if (nread > nbytes)
+{
+    log_debug("read %zu more bytes than were available", nread - nbytes);
+//    error_flag = true;
+nread = nbytes;
+//    break;
+}
+            nbytes -= nread;
+            bufp += nread;
+            if (!nread)
+            {
+                log_debug("breaking");
+                break;
+            }
+        }
+log_debug("nbytes %zu", nbytes);
+//        if (nbytes > 0)
+        {
+            // "abc123" 6
+            // bufp  ^
+            // nbytes 1
+            // "3bc123"
+            //   ^ bufp = buf + nbytes;
+            // buflen = endp - bufp;
+log_debug("buflen %zu", buflen);
+            memmove(buf, bufp, nbytes);
+            buflen = sizeof(buf) - (endp - bufp);
+            bufp = buf + nbytes;
+log_debug("buflen %zu", buflen);
+        }
+    }
+int64_t total_us = get_monotonic_time_usec() - start_us;
+printf("%ld usecs\n", total_us);
+printf("%.3f/us\n", (double)num_parsed/total_us);
+printf("%.3f/ms\n", (double)num_parsed/TO_MSECS((double)total_us));
+printf("%.3f/s\n\n", (double)num_parsed/TO_SECS((double)total_us));
+if (feof(fp))
+{
+    printf("read entire file\n");
+    printf("parsed %ld requests\n", num_parsed);
+}
+    fclose(fp);
+}
+#if 0
+static void
+test_request_parsing(htparser * parser)
+{
+    log_debug("(%p)", parser);
+    static const char msg[] =
+        "POST /test-chunked-php/abc?abc=123 HTTP/1.1\r\n"
+        "Content-type: text/plain\r\n"
+        "Transfer-encoding: chunked\r\n"
+        "\r\n"
+        "7\r\n"
+        "Welcome\r\n"
+        "1c\r\n"
+        "to Mozilla Developer Network\r\n"
+        "0\r\n"
+        "\r\n"
+        "GET http://www.thehost.com:8080/images/test-imagegifabc123 HTTP/1.1\r\n"
+        "Host: www.thehost.com\r\n"
+        "\r\n"
+        "GET /images/test-image-2.gif HTTP/1.1\r\n"
+        "Host: www.thehost.com\r\n"
+        "Accept: image/gif\r\n"
+        "\r\n"
+        "POST /this/is/the/path?this=is&the=query HTTP/1.1\r\n"
+        "Host: www.thehost.com\r\n"
+        "Content-length: 10\r\n"
+        "\r\n"
+        "12345=6789"
+    ;
+    const char * curp = msg;
+    size_t len = sizeof(msg) - 1;
+    size_t avail = len/*10*/;
+    htparser_init(parser, htp_type_request);
+    while (len > 0)
+    {
+        size_t nread = htparser_run(parser, &request_psets, curp, avail);
+        log_debug("read %zu of %zu bytes", nread, avail);
+        if (parser->error != htparse_error_none)
+        {
+            log_debug("failed");
+            break;
+        }
+//        avail -= nread;
+len -= nread;
+        curp += nread;
+avail += 10;
+if (avail > len) avail = len;
+    }
+}
+#endif
+
+static void
+test_response_parsing(htparser * parser)
+{
+    log_debug("(%p)", parser);
+    static const char msg[] =
+        "HTTP/1.1 200 OK\r\n"
+        "Content-type: text/html\r\n"
+        "Transfer-encoding: chunked\r\n"
+        "\r\n"
+        "8\r\n"
+        "<Welcome\r\n"
+        "1c\r\n"
+        "to>Mozilla Developer Network\r\n"
+        "0\r\n"
+        "\r\n"
+        "HTTP/1.1 200 OK\r\n"
+        "Content-type: text/plain\r\n"
+        "Content-length: 10\r\n"
+        "\r\n"
+        "1234567890"
+    ;
+    const char * curp = msg;
+    size_t len = sizeof(msg) - 1;
+    size_t avail = 84;
+    htparser_init(parser, htp_type_response);
+    while (len > 0)
+    {
+        size_t nread = htparser_run(parser, &response_psets, curp, avail);
+        log_debug("read %zu of %zu bytes", nread, avail);
+        if (parser->error != htparse_error_none)
+        {
+            log_debug("failed");
+            break;
+        }
+//        avail -= nread;
+len -= nread;
+        curp += nread;
+if (nread == 0) avail += 1;
+if (avail > len) avail = len;
+    }
+}
+
+int main(int argc, char ** argv)
+{
+    htparser * parser = htparser_new();
+log_debug("parser %p, %zu bytes", parser, sizeof(*parser));
+    test_request_parsing(parser);
+//    test_response_parsing(parser);
+    free(parser);
+    log_debug("done");
+    return 0;
+}
+#endif//WITH_HTPARSER_TEST

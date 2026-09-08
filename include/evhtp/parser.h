@@ -120,6 +120,7 @@ EVHTP_EXPORT void         * htparser_get_userdata(htparser *);
 EVHTP_EXPORT void           htparser_set_userdata(htparser *, void *);
 EVHTP_EXPORT void           htparser_init(htparser *, htp_type);
 EVHTP_EXPORT htparser     * htparser_new(void);
+EVHTP_EXPORT void           htparser_free(htparser *);
 EVHTP_EXPORT size_t         htparser_run_eof(htparser *, htparse_hooks *);
 EVHTP_EXPORT void           htparser_set_skip_body(htparser *);
 
