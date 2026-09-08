@@ -1778,7 +1778,7 @@ htparser_run_eof(htparser * p, htparse_hooks * hooks)
 }
 
 
-#define WITH_HTPARSER_TEST
+//#define WITH_HTPARSER_TEST
 #ifdef WITH_HTPARSER_TEST
 static int
 htp__request_parse_start_(htparser * p)
