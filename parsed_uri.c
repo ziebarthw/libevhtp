@@ -9,7 +9,7 @@ do { \
 } while(0)
 
 static inline bool
-parse_uri_view_internal(const char *url, size_t len, struct parsed_uri *out)
+parse_uri_view_internal(const char *url, size_t len, bool is_connect, struct parsed_uri *out)
 {
     if (__builtin_expect(url == NULL || len == 0 || len > 65535, 0))
         return false;
@@ -17,6 +17,59 @@ parse_uri_view_internal(const char *url, size_t len, struct parsed_uri *out)
     memset(out, 0, sizeof(*out));
     const char *p = url;
     const char *end = url + len;
+
+    // =========================================================================
+    // CONNECT: Authority-form only (host:port), no scheme/path/query/fragment
+    // =========================================================================
+    if (__builtin_expect(is_connect, 0))
+    {
+        const char *cursor = p;
+
+        // IPv6 literal: "[::1]:443"
+        if (*cursor == '[')
+        {
+            const char *close_bracket = memchr(cursor, ']', (size_t)(end - cursor));
+            if (!close_bracket) return false; // Malformed IPv6
+
+            SET_FIELD(out, URI_HOST, cursor + 1, close_bracket, url);
+            out->flags |= URI_IS_IPV6;
+            out->flags |= URI_HAS_HOST;
+            cursor = close_bracket + 1;
+        }
+        else
+        {
+            // IPv4 or DNS host
+            const char *port_sep = memchr(cursor, ':', (size_t)(end - cursor));
+            const char *host_end = port_sep ? port_sep : end;
+            if (host_end == cursor) return false; // Empty host
+            SET_FIELD(out, URI_HOST, cursor, host_end, url);
+            out->flags |= URI_HAS_HOST;
+            cursor = host_end;
+        }
+
+        // CONNECT requires an explicit port per RFC 7231 (authority-form)
+        if (cursor >= end || *cursor != ':')
+            return false;
+
+        cursor++;
+        if (cursor >= end) return false; // Empty port
+
+        // Fast integer conversion for port
+        uint32_t port = 0;
+        for (const char *d = cursor; d < end; d++)
+        {
+            if (*d < '0' || *d > '9') return false; // Invalid port char
+            port = port * 10 + (uint32_t)(*d - '0');
+        }
+        if (port == 0 || port > 65535) return false;
+        out->port_num = (uint16_t)port;
+
+        SET_FIELD(out, URI_PORT, cursor, end, url);
+        out->flags |= URI_HAS_PORT;
+        out->flags |= URI_IS_AUTHORITY_FORM;
+
+        return true;
+    }
 
     // =========================================================================
     // PHASE 1: Scheme (scan for ':' before '/', '?', or '#')
@@ -268,10 +321,10 @@ parsed_uri_to_cstr(const char* p, const struct parsed_uri* u)
 }
 
 struct parsed_uri
-parse_uri_view(const htp_string_t uri_string)
+parse_uri_view(const htp_string_t uri_string, bool is_connect)
 {
     struct parsed_uri out = {0};
-    if (!parse_uri_view_internal(uri_string.startp, uri_string.len, &out))
+    if (!parse_uri_view_internal(uri_string.startp, uri_string.len, is_connect, &out))
         out.flags |= URI_HAS_ERROR;
     return out;
 }

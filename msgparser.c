@@ -709,9 +709,38 @@ get_scheme_type(const htp_string_t * scheme)
 }
 
 static bool
-consume_uri(htparser * self, request_line_t * request_line, const htp_string_t * uri)
+emit_host_port(htparser * self, const char * startp, struct parsed_uri * u)
 {
-    log_debug("(%p, %p, %p(%.*s))", self, request_line, uri, (int)uri->len, uri->startp);
+    log_debug("(%p, %p, %p)", self, startp, u);
+
+    htp_string_t host = parsed_uri_get_host(startp, u);
+    if (hook_host_run(self, self->hooks, host.startp, host.len))
+    {
+        self->error = htparse_error_user;
+        return false;
+    }
+
+    if (parsed_uri_has_port(u))
+    {
+        htp_string_t host_port = parsed_uri_get_host_port(startp, u);
+        const char * startp = host_port.startp;
+        while (startp[0] != ':') ++startp;
+        ++startp;
+        update_cursor_nread(&host_port, startp - host_port.startp);
+        if (hook_port_run(self, self->hooks, host_port.startp, host_port.len))
+        {
+            self->error = htparse_error_user;
+            return false;
+        }
+    }
+
+    return true;
+}
+
+static bool
+consume_uri(htparser * self, request_line_t * request_line, const htp_string_t * uri, bool is_connect)
+{
+    log_debug("(%p, %p, %p(%.*s), %u)", self, request_line, uri, (int)uri->len, uri->startp, is_connect);
 
     request_line->scheme = htp_scheme_unknown;
 
@@ -738,7 +767,7 @@ consume_uri(htparser * self, request_line_t * request_line, const htp_string_t *
     }
     else
     {
-        struct parsed_uri u = parse_uri_view(*uri);
+        struct parsed_uri u = parse_uri_view(*uri, is_connect);
         if (parsed_uri_has_error(&u))
         {
             log_debug("parse uri view failed");
@@ -746,63 +775,71 @@ consume_uri(htparser * self, request_line_t * request_line, const htp_string_t *
             return false;
         }
 
-        htp_string_t scheme = parsed_uri_get_scheme(startp, &u);
-        htp_scheme scheme_type = get_scheme_type(&scheme);
-        if (scheme_type == htp_scheme_unknown)
+        if (parsed_uri_is_authority_form(&u))
         {
-            log_debug("invalid scheme");
-            self->error = htparse_error_inval_schema;
-            return false;
-        }
-
-        if (hook_scheme_run(self, self->hooks, scheme.startp, scheme.len))
-        {
-            self->error = htparse_error_user;
-            return false;
-        }
-
-        htp_string_t host = parsed_uri_get_host(startp, &u);
-        if (hook_host_run(self, self->hooks, host.startp, host.len))
-        {
-            self->error = htparse_error_user;
-            return false;
-        }
-
-        if (parsed_uri_has_port(&u))
-        {
-            htp_string_t host_port = parsed_uri_get_host_port(startp, &u);
-            const char * startp = host_port.startp;
-            while (startp[0] != ':') ++startp;
-            ++startp;
-            update_cursor_nread(&host_port, startp - host_port.startp);
-            if (hook_port_run(self, self->hooks, host_port.startp, host_port.len))
+            if (!emit_host_port(self, startp, &u))
             {
+                log_debug("failed");
+                return false;
+            }
+            if (hook_path_run(self, self->hooks, "/", 1))
+            {
+                log_debug("failed");
+                self->error = htparse_error_user;
+                return false;
+            }
+            if (hook_uri_run(self, self->hooks, uri->startp, uri->len))
+            {
+                log_debug("failed");
                 self->error = htparse_error_user;
                 return false;
             }
         }
-
-        htp_string_t path = parsed_uri_get_path(startp, &u);
-        if (hook_path_run(self, self->hooks, path.startp, path.len))
+        else
         {
-            self->error = htparse_error_user;
-            return false;
-        }
+            htp_string_t scheme = parsed_uri_get_scheme(startp, &u);
+            htp_scheme scheme_type = get_scheme_type(&scheme);
+            if (scheme_type == htp_scheme_unknown)
+            {
+                log_debug("invalid scheme");
+                self->error = htparse_error_inval_schema;
+                return false;
+            }
 
-        if (parsed_uri_has_query(&u))
-        {
-            htp_string_t args = parsed_uri_get_query(startp, &u);
-            if (hook_args_run(self, self->hooks, args.startp, args.len))
+            if (hook_scheme_run(self, self->hooks, scheme.startp, scheme.len))
             {
                 self->error = htparse_error_user;
                 return false;
             }
-        }
 
-        if (hook_uri_run(self, self->hooks, uri->startp, uri->len))
-        {
-            self->error = htparse_error_user;
-            return false;
+            if (!emit_host_port(self, startp, &u))
+            {
+                log_debug("failed");
+                return false;
+            }
+
+            htp_string_t path = parsed_uri_get_path(startp, &u);
+            if (hook_path_run(self, self->hooks, path.startp, path.len))
+            {
+                self->error = htparse_error_user;
+                return false;
+            }
+
+            if (parsed_uri_has_query(&u))
+            {
+                htp_string_t args = parsed_uri_get_query(startp, &u);
+                if (hook_args_run(self, self->hooks, args.startp, args.len))
+                {
+                    self->error = htparse_error_user;
+                    return false;
+                }
+            }
+
+            if (hook_uri_run(self, self->hooks, uri->startp, uri->len))
+            {
+                self->error = htparse_error_user;
+                return false;
+            }
         }
     }
 
@@ -829,6 +866,10 @@ parse_request_line(htparser * self, const char * startp, const char * endp)
         return false;
     }
     request_line->method = method_num;
+if (method_num == htp_method_CONNECT)
+{
+    log_debug("connect method\n\"%.*s\"", (int)(endp - startp), startp);
+}
 
     if (hook_method_run(self, self->hooks, method.startp, method.len))
     {
@@ -842,7 +883,8 @@ parse_request_line(htparser * self, const char * startp, const char * endp)
         self->error = htparse_error_inval_reqline;
         return false;
     }
-    if (!consume_uri(self, request_line, &uri))
+log_debug("uri \"%.*s\"", (int)uri.len, uri.startp);
+    if (!consume_uri(self, request_line, &uri, method_num == htp_method_CONNECT))
     {
         log_debug("failed");
         return false;
@@ -1291,7 +1333,6 @@ parse_length(htparser * self, const char * data, size_t len)
     log_debug("(%p, %p, %zu)", self, data, len);
 
     size_t chunk = len > self->content_len ? self->content_len : len;
-    log_debug("\"%.*s\"", (int)chunk, data);
     if (chunk > 0 &&
         hook_body_run(self, self->hooks, data, chunk))
     {
@@ -1453,6 +1494,8 @@ htparser_run(htparser * self, htparse_hooks * hooks, const char * data, size_t l
         .len = len
     };
 
+log_debug("\n\"%.*s\"", (int)len, data);
+
     while (1)
     {
         parser_state_e prev_state = self->state;
@@ -1524,9 +1567,16 @@ int
 htparser_should_keep_alive(htparser * self)
 {
     log_debug("(%p)", self);
+#if 0
     return self &&
             (self->flags & CONNECTION_KEEP_ALIVE) ||
                 ((self->major > 0 && self->minor > 0) && !(self->flags & CONNECTION_CLOSE));
+#endif
+bool rval = self &&
+            (self->flags & CONNECTION_KEEP_ALIVE) ||
+                ((self->major > 0 && self->minor > 0) && !(self->flags & CONNECTION_CLOSE));
+log_debug("rval %u", rval);
+return rval;
 }
 
 void *

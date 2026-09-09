@@ -2713,7 +2713,7 @@ hdrline_start:
     return i;
 }         /* htparser_run */
 
-//#define WITH_HTPARSER_TEST
+#define WITH_HTPARSER_TEST
 #ifdef WITH_HTPARSER_TEST
 static int
 htp__request_parse_start_(htparser * p)
@@ -2918,8 +2918,12 @@ static void
 test_request_parsing(htparser * parser)
 {
     log_debug("(%p)", parser);
-#if 0
     static const char msg[] =
+        "CONNECT static.addtoany.com:443 HTTP/1.1\r\n"
+        "Host: static.addtoany.com:443\r\n"
+        "User-Agent: curl/8.15.0\r\n"
+        "Proxy-Connection: Keep-Alive\r\n"
+        "\r\n"
         "POST /test-chunked-php/abc?abc=123 HTTP/1.1\r\n"
         "Content-type: text/plain\r\n"
         "Transfer-encoding: chunked\r\n"
@@ -2946,10 +2950,10 @@ test_request_parsing(htparser * parser)
     const char * curp = msg;
     size_t len = sizeof(msg) - 1;
     size_t avail = /*10*/len;
-    msgparser_init(parser, htp_type_request);
+    htparser_init(parser, htp_type_request);
     while (len > 0)
     {
-        size_t nread = msgparser_run(parser, &request_psets, curp, avail);
+        size_t nread = htparser_run(parser, &request_psets, curp, avail);
         log_debug("read %zu of %zu bytes", nread, avail);
         if (parser->error != htparse_error_none)
         {
@@ -2962,8 +2966,8 @@ len -= nread;
 avail += 10;
 if (avail > len) avail = len;
     }
-#endif//0
 
+#if 0
     FILE * fp = fopen("/home/parallels/projects/RProxy-htm8/tmp/requests_only.log", "rt");
     char buf[8192];
     char * bufp = buf;
@@ -3030,6 +3034,7 @@ if (feof(fp))
     printf("parsed %ld requests\n", num_parsed);
 }
     fclose(fp);
+#endif//0
 }
 #if 0
 static void

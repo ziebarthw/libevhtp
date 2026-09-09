@@ -31,19 +31,20 @@ enum url_fields {
 struct parsed_uri {
     uri_field_data_t fields[URI_FIELD_COUNT];
     uint16_t port_num;
-    #define URI_HAS_SCHEME   (1u << 0)
-    #define URI_HAS_USERINFO (1u << 1)
-    #define URI_HAS_HOST     (1u << 2)
-    #define URI_HAS_PORT     (1u << 3)
-    #define URI_HAS_PATH     (1u << 4)
-    #define URI_HAS_QUERY    (1u << 5)
-    #define URI_HAS_FRAGMENT (1u << 6)
-    #define URI_HAS_ERROR    (1u << 7)
-    #define URI_IS_IPV6      (1u << 8)
+    #define URI_HAS_SCHEME        (1u << 0)
+    #define URI_HAS_USERINFO      (1u << 1)
+    #define URI_HAS_HOST          (1u << 2)
+    #define URI_HAS_PORT          (1u << 3)
+    #define URI_HAS_PATH          (1u << 4)
+    #define URI_HAS_QUERY         (1u << 5)
+    #define URI_HAS_FRAGMENT      (1u << 6)
+    #define URI_HAS_ERROR         (1u << 7)
+    #define URI_IS_IPV6           (1u << 8)
+    #define URI_IS_AUTHORITY_FORM (1u << 9)
     uint16_t flags;
 };
 
-struct parsed_uri parse_uri_view(const htp_string_t uri_string);
+struct parsed_uri parse_uri_view(const htp_string_t uri_string, bool is_connect);
 
 /**
  * Get the |authority| (section that comes after the scheme and before the path.
@@ -72,49 +73,55 @@ char* parsed_uri_to_cstr(const char* p, const struct parsed_uri* u);
 static inline bool
 parsed_uri_has_scheme(const struct parsed_uri* u)
 {
-    return u ? (u->flags & URI_HAS_SCHEME) : false;
+    return u ? !!(u->flags & URI_HAS_SCHEME) : false;
 }
 
 static inline bool
 parsed_uri_has_host(const struct parsed_uri* u)
 {
-    return u ? (u->flags & URI_HAS_HOST) : false;
+    return u ? !!(u->flags & URI_HAS_HOST) : false;
 }
 
 static inline bool
 parsed_uri_has_port(const struct parsed_uri* u)
 {
-    return u ? (u->flags & URI_HAS_PORT) : false;
+    return u ? !!(u->flags & URI_HAS_PORT) : false;
 }
 
 static inline bool
 parsed_uri_has_user_info(const struct parsed_uri* u)
 {
-    return u ? (u->flags & URI_HAS_USERINFO) : false;
+    return u ? !!(u->flags & URI_HAS_USERINFO) : false;
 }
 
 static inline bool
 parsed_uri_has_path(const struct parsed_uri* u)
 {
-    return u ? (u->flags & URI_HAS_PATH) : false;
+    return u ? !!(u->flags & URI_HAS_PATH) : false;
 }
 
 static inline bool
 parsed_uri_has_query(const struct parsed_uri* u)
 {
-    return u ? (u->flags & URI_HAS_QUERY) : false;
+    return u ? !!(u->flags & URI_HAS_QUERY) : false;
 }
 
 static inline bool
 parsed_uri_has_fragment(const struct parsed_uri* u)
 {
-    return u ? (u->flags & URI_HAS_FRAGMENT) : false;
+    return u ? !!(u->flags & URI_HAS_FRAGMENT) : false;
 }
 
 static inline bool
 parsed_uri_has_error(const struct parsed_uri* u)
 {
-    return u ? (u->flags & URI_HAS_ERROR) : false;
+    return u ? !!(u->flags & URI_HAS_ERROR) : false;
+}
+
+static inline bool
+parsed_uri_is_authority_form(const struct parsed_uri* u)
+{
+    return u ? !!(u->flags & URI_IS_AUTHORITY_FORM) : false;
 }
 
 static inline htp_string_t
