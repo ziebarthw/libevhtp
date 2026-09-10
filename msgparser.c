@@ -136,7 +136,7 @@ struct htparser {
     unsigned char minor;
 
     #define HAVE_HOST              (1 << 0)
-    #define HAVE_CONTENT_LENTH     (1 << 1)
+    #define HAVE_CONTENT_LENGTH    (1 << 1)
     #define HAVE_CONTENT_TYPE      (1 << 2)
     #define HAVE_TRANSFER_ENCODING (1 << 3)
     #define HAVE_CONNECTION        (1 << 4)
@@ -993,15 +993,16 @@ match_key_name(const char * startp, size_t klen, const char * name, size_t nlen)
 static inline bool
 consume_header(htparser * self, const htp_string_t * key, const htp_string_t * val)
 {
-    static const char host_name[] = "Host";
-    static const char content_length[] = "Content-length";
-    static const char content_type[] = "Content-type";
+    static const char host_name[]         = "Host";
+    static const char content_length[]    = "Content-length";
+    static const char content_type[]      = "Content-type";
     static const char transfer_encoding[] = "Transfer-encoding";
-    static const char connection[] = "Connection";
-    static const char chunked[] = "chunked";
-    static const char close[] = "close";
-    static const char keep_alive[] = "keep-alive";
-    static const char multipart[] = "multipart";
+    static const char connection[]        = "Connection";
+
+    static const char chunked[]           = "chunked";
+    static const char close[]             = "close";
+    static const char keep_alive[]        = "keep-alive";
+    static const char multipart[]         = "multipart";
 
     log_debug("(%p, %p, %p)", self, key, val);
 
@@ -1018,49 +1019,66 @@ consume_header(htparser * self, const htp_string_t * key, const htp_string_t * v
         return false;
     }
 
-    if (!(self->flags & HAVE_HOST) && MATCHES_NAME(key, host_name))
+    switch (key->len)
     {
-        if (hook_hostname_run(self, self->hooks, val->startp, val->len))
-        {
-            self->error = htparse_error_user;
-            return false;
-        }
-        self->flags |= HAVE_HOST;
-    }
-    else if (!(self->flags & HAVE_CONTENT_LENTH) && MATCHES_NAME(key, content_length))
-    {
-        int err = 0;
-        self->content_len = str_to_uint64(val->startp, val->len, &err);
-        if (err == 1)
-        {
-            self->error = htparse_error_too_big;
-            return false;
-        }
-        self->orig_content_len = self->content_len;
-        self->flags |= HAVE_CONTENT_LENTH;
-    }
-    else if (!(self->flags & HAVE_CONTENT_TYPE) && MATCHES_NAME(key, content_type))
-    {
-        htp_string_t s = *val;
-        const char * curp = memchr(s.startp, '/', s.len);
-        if (curp)
-        {
-            log_debug("found slash");
-            s.len = curp - s.startp;
-        }
-        if (MATCHES_NAME(&s, multipart)) self->flags |= IS_MUTLIPART;
-    }
-    else if (!(self->flags & HAVE_TRANSFER_ENCODING) && MATCHES_NAME(key, transfer_encoding))
-    {
-        if (MATCHES_NAME(val, chunked)) self->flags |= IS_CHUNKED;
-        self->flags |= HAVE_TRANSFER_ENCODING;
-    }
-    else if (!(self->flags & HAVE_CONNECTION) && MATCHES_NAME(key, connection))
-    {
-        if (MATCHES_NAME(val, close))
-            self->flags |= CONNECTION_CLOSE;
-        else if (MATCHES_NAME(val, keep_alive))
-            self->flags |= CONNECTION_KEEP_ALIVE;
+        case sizeof(host_name) - 1:
+            if (!(self->flags & HAVE_HOST) && MATCHES_NAME(key, host_name))
+            {
+                if (hook_hostname_run(self, self->hooks, val->startp, val->len))
+                {
+                    self->error = htparse_error_user;
+                    return false;
+                }
+                self->flags |= HAVE_HOST;
+            }
+            break;
+        case sizeof(connection) - 1:
+            if (!(self->flags & HAVE_CONNECTION) && MATCHES_NAME(key, connection))
+            {
+                if (MATCHES_NAME(val, close))
+                    self->flags |= CONNECTION_CLOSE;
+                else if (MATCHES_NAME(val, keep_alive))
+                    self->flags |= CONNECTION_KEEP_ALIVE;
+                self->flags |= HAVE_CONNECTION;
+            }
+            break;
+        case sizeof(content_type) - 1:
+            if (!(self->flags & HAVE_CONTENT_TYPE) && MATCHES_NAME(key, content_type))
+            {
+                htp_string_t s = *val;
+                const char * curp = memchr(s.startp, '/', s.len);
+                if (curp)
+                {
+                    log_debug("found slash");
+                    s.len = curp - s.startp;
+                }
+                if (MATCHES_NAME(&s, multipart)) self->flags |= IS_MUTLIPART;
+                self->flags |= HAVE_CONTENT_TYPE;
+            }
+            break;
+        case sizeof(content_length) - 1:
+            if (!(self->flags & HAVE_CONTENT_LENGTH) && MATCHES_NAME(key, content_length))
+            {
+                int err = 0;
+                self->content_len = str_to_uint64(val->startp, val->len, &err);
+                if (err == 1)
+                {
+                    self->error = htparse_error_too_big;
+                    return false;
+                }
+                self->orig_content_len = self->content_len;
+                self->flags |= HAVE_CONTENT_LENGTH;
+            }
+            break;
+        case sizeof(transfer_encoding) - 1:
+            if (!(self->flags & HAVE_TRANSFER_ENCODING) && MATCHES_NAME(key, transfer_encoding))
+            {
+                if (MATCHES_NAME(val, chunked)) self->flags |= IS_CHUNKED;
+                self->flags |= HAVE_TRANSFER_ENCODING;
+            }
+            break;
+        default:
+            break;
     }
 
     if (hook_hdr_val_run(self, self->hooks, val->startp, val->len))
@@ -1494,8 +1512,6 @@ htparser_run(htparser * self, htparse_hooks * hooks, const char * data, size_t l
         .len = len
     };
 
-log_debug("\n\"%.*s\"", (int)len, data);
-
     while (1)
     {
         parser_state_e prev_state = self->state;
@@ -1567,16 +1583,9 @@ int
 htparser_should_keep_alive(htparser * self)
 {
     log_debug("(%p)", self);
-#if 0
     return self &&
             (self->flags & CONNECTION_KEEP_ALIVE) ||
                 ((self->major > 0 && self->minor > 0) && !(self->flags & CONNECTION_CLOSE));
-#endif
-bool rval = self &&
-            (self->flags & CONNECTION_KEEP_ALIVE) ||
-                ((self->major > 0 && self->minor > 0) && !(self->flags & CONNECTION_CLOSE));
-log_debug("rval %u", rval);
-return rval;
 }
 
 void *
