@@ -186,10 +186,10 @@ parse_uri_view_internal(const char *url, size_t len, bool is_connect, struct par
     return true;
 }
 
-htp_string_t
+htstring_t
 parsed_uri_get_authority(const char* p, const struct parsed_uri* u)
 {
-    htp_string_t rval = {
+    htstring_t rval = {
         .startp = p,
         .len = 0
     };
@@ -225,10 +225,10 @@ parsed_uri_get_authority(const char* p, const struct parsed_uri* u)
 }
 
 // Get the "host" and optional "port" component of the uri (host[:port]).
-htp_string_t
+htstring_t
 parsed_uri_get_host_port(const char* p, const struct parsed_uri* u)
 {
-    htp_string_t rval = {
+    htstring_t rval = {
         .startp = p,
         .len = 0
     };
@@ -253,7 +253,7 @@ parsed_uri_get_host_port(const char* p, const struct parsed_uri* u)
 }
 
 static char *
-append_field(const htp_string_t* field, char * dest)
+append_field(const htstring_t* field, char * dest)
 {
     if (field->len)
     {
@@ -264,22 +264,22 @@ append_field(const htp_string_t* field, char * dest)
 }
 
 char*
-parsed_uri_join(const htp_string_t scheme, const htp_string_t userinfo, const htp_string_t host_port,
-                const htp_string_t path, const htp_string_t query, const htp_string_t fragment)
+parsed_uri_join(const htstring_t scheme, const htstring_t userinfo, const htstring_t host_port,
+                const htstring_t path, const htstring_t query, const htstring_t fragment)
 {
-    htp_string_t scheme_sep = {
+    htstring_t scheme_sep = {
         .startp = "://",
         .len = 3
     };
-    htp_string_t userinfo_sep = {
+    htstring_t userinfo_sep = {
         .startp = "@",
         .len = userinfo.len ? 1 : 0
     };
-    htp_string_t query_sep = {
+    htstring_t query_sep = {
         .startp = "?",
         .len = query.len ? 1 : 0
     };
-    htp_string_t frag_sep = {
+    htstring_t frag_sep = {
         .startp = "#",
         .len = fragment.len ? 1 : 0
     };
@@ -321,7 +321,7 @@ parsed_uri_to_cstr(const char* p, const struct parsed_uri* u)
 }
 
 struct parsed_uri
-parse_uri_view(const htp_string_t uri_string, bool is_connect)
+parse_uri_view(const htstring_t uri_string, bool is_connect)
 {
     struct parsed_uri out = {0};
     if (!parse_uri_view_internal(uri_string.startp, uri_string.len, is_connect, &out))

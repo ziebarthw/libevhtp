@@ -53,6 +53,7 @@ set(LIBEVHTP_SOURCE_FILES
     numtoa.c
     msgparser.c
     parsed_uri.c
+    tokenizer.c
     log.c)
 
 find_package(LibEvent REQUIRED)
@@ -65,6 +66,8 @@ set(evhtp_dir_headers
   "include/evhtp/parser.h"
   "include/evhtp/msgparser.h"
   "include/evhtp/parsed_uri.h"
+  "include/evhtp/string.h"
+  "include/evhtp/tokenizer.h"
   "include/evhtp/log.h")
 
 if(NOT EVHTP_DISABLE_SSL)

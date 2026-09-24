@@ -2025,7 +2025,7 @@ htp__request_parse_headers_(htparser * p)
 
     /* XXX proto should be set with htparsers on_hdrs_begin hook */
 
-    if (htparser_should_keep_alive(p) == 1) {
+    if (htparser_should_keep_alive(p)) {
         HTP_FLAG_ON(req, EVHTP_REQ_FLAG_KEEPALIVE);
     }
 
@@ -2034,14 +2034,13 @@ htp__request_parse_headers_(htparser * p)
         HTP_FLAG_ON(req, EVHTP_REQ_FLAG_END_STREAM);
         htparser_set_skip_body(p);
     }
-    else if (htparser_get_content_length(p)) {
-        log_debug("content length");
-    }
     else if (htparser_is_chunked(p)) {
         log_debug("chunked");
     }
-    else if (htparser_is_identity_response(p)
-            && htparser_should_keep_alive(p) == 0) {
+    else if (htparser_has_content_length(p)) {
+        log_debug("content length");
+    }
+    else if (htparser_is_identity_response(p)) {
         /*
          * Responses that may carry a body without an explicit length are read
          * until EOF.
@@ -2559,6 +2558,10 @@ htp__connection_readcb_(struct bufferevent * bev, void * arg)
         log_debug("error %d(%s), freeing connection",
             htparser_get_error(c->parser),
             htparser_get_strerror(c->parser));
+
+        if (c->request) {
+            htp__hook_error_(c->request, BEV_EVENT_ERROR);
+        }
 
         evhtp_safe_free(c, evhtp_connection_free);
     } else if (nread < avail) {
@@ -3242,6 +3245,7 @@ htp__connection_new_(evhtp_t * htp, evutil_socket_t sock, evhtp_type type)
     htparser_init(connection->parser, ptype);
     htparser_set_userdata(connection->parser, connection);
 
+log_debug("connection %p, %zu bytes", connection, sizeof(*connection));
     return connection;
 }     /* htp__connection_new_ */
 
@@ -3832,7 +3836,7 @@ match_header_key(evhtp_kv_t * kv, const char * key, size_t len)
 }
 
 static inline const char *
-evhtp_kv_find_n_(evhtp_kvs_t * kvs, const char * key, size_t len)
+kv_find_n(evhtp_kvs_t * kvs, const char * key, size_t len)
 {
     evhtp_kv_t * kv;
 
@@ -3852,7 +3856,7 @@ evhtp_kv_find_n(evhtp_kvs_t * kvs, const char * key, size_t len)
         return NULL;
     }
 
-    return evhtp_kv_find_n_(kvs, key, len);
+    return kv_find_n(kvs, key, len);
 }
 
 const char *
@@ -3862,7 +3866,42 @@ evhtp_kv_find(evhtp_kvs_t * kvs, const char * key)
         return NULL;
     }
 
-    return evhtp_kv_find_n_(kvs, key, strlen(key));
+    return kv_find_n(kvs, key, strlen(key));
+}
+
+static inline int
+kvs_count_kv_n(evhtp_kvs_t * kvs, const char * key, size_t len)
+{
+    evhtp_kv_t * kv;
+    int          count = 0;
+
+    TAILQ_FOREACH(kv, kvs, next) {
+        if (match_header_key(kv, key, len)) {
+            ++count;
+        }
+    }
+
+    return count;
+}
+
+int
+evhtp_kvs_count_kv_n(evhtp_kvs_t * kvs, const char * key, size_t len)
+{
+    if (evhtp_unlikely(kvs == NULL || key == NULL)) {
+        return 0;
+    }
+
+    return kvs_count_kv_n(kvs, key, strlen(key));
+}
+
+int
+evhtp_kvs_count_kv(evhtp_kvs_t * kvs, const char * key)
+{
+    if (evhtp_unlikely(kvs == NULL || key == NULL)) {
+        return 0;
+    }
+
+    return kvs_count_kv_n(kvs, key, strlen(key));
 }
 
 void
@@ -3948,7 +3987,7 @@ evhtp_header_new(const char * key, const char * val, char kalloc, char valloc)
 }
 
 static inline evhtp_kv_t *
-evhtp_kvs_find_kv_n_(evhtp_kvs_t * kvs, const char * key, size_t len)
+kvs_find_kv_n(evhtp_kvs_t * kvs, const char * key, size_t len)
 {
     evhtp_kv_t * kv;
 
@@ -3968,7 +4007,7 @@ evhtp_kvs_find_kv(evhtp_kvs_t * kvs, const char * key)
         return NULL;
     }
 
-    return evhtp_kvs_find_kv_n_(kvs, key, strlen(key));
+    return kvs_find_kv_n(kvs, key, strlen(key));
 }
 
 evhtp_kv_t *
@@ -3978,7 +4017,7 @@ evhtp_kvs_find_kv_n(evhtp_kvs_t * kvs, const char * key, size_t len)
         return NULL;
     }
 
-    return evhtp_kvs_find_kv_n_(kvs, key, len);
+    return kvs_find_kv_n(kvs, key, len);
 }
 
 void
@@ -4458,7 +4497,8 @@ evhtp_response_needs_body(const evhtp_res code, const htp_method method)
     return code != EVHTP_RES_NOCONTENT &&
            code != EVHTP_RES_NOTMOD &&
            (code < 100 || code >= 200) &&
-           method != htp_method_HEAD;
+           method != htp_method_HEAD &&
+           (method != htp_method_CONNECT || code != EVHTP_RES_OK);
 }
 
 void
@@ -6640,6 +6680,7 @@ freecb(evbev_t* bev, void* arg)
 void
 evhtp_connection_free(evhtp_connection_t * connection)
 {
+log_debug("(%p)", connection);
     if (evhtp_unlikely(connection == NULL)) {
         return;
     }

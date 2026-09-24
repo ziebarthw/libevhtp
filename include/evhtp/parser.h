@@ -29,7 +29,8 @@ enum htp_scheme {
 };
 
 enum htp_method {
-    htp_method_GET = 0,
+    htp_method_UNKNOWN = 0,
+    htp_method_GET,
     htp_method_HEAD,
     htp_method_POST,
     htp_method_PUT,
@@ -45,7 +46,7 @@ enum htp_method {
     htp_method_TRACE,
     htp_method_CONNECT, /* RFC 2616 */
     htp_method_PATCH,   /* RFC 5789 */
-    htp_method_UNKNOWN,
+    htp_method_LAST
 };
 
 enum htpparse_error {
@@ -125,6 +126,7 @@ EVHTP_EXPORT size_t         htparser_run_eof(htparser *, htparse_hooks *);
 EVHTP_EXPORT void           htparser_set_skip_body(htparser *);
 
 EVHTP_EXPORT int            htparser_is_chunked(htparser *);
+EVHTP_EXPORT int            htparser_has_content_length(htparser *);
 EVHTP_EXPORT int            htparser_uses_transfer_encoding(htparser *);
 EVHTP_EXPORT uint64_t       htparser_get_bytes_read(htparser *);
 

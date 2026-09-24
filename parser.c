@@ -520,7 +520,7 @@ htparser_set_method(htparser * p, htp_method meth)
 const char *
 htparser_get_methodstr_m(htp_method meth)
 {
-    if (meth >= htp_method_UNKNOWN)
+    if (meth >= htp_method_LAST)
     {
         return NULL;
     }

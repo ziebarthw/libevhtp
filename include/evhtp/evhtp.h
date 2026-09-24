@@ -305,10 +305,10 @@ struct evhtp {
     uint64_t                max_body_size;
     uint64_t                max_keepalive_requests;
 
-    #define EVHTP_FLAG_ENABLE_100_CONT     (1 << 1)
-    #define EVHTP_FLAG_ENABLE_REUSEPORT    (1 << 2)
-    #define EVHTP_FLAG_ENABLE_NODELAY      (1 << 3)
-    #define EVHTP_FLAG_ENABLE_DEFER_ACCEPT (1 << 4)
+    #define EVHTP_FLAG_ENABLE_100_CONT     (1 << 0)
+    #define EVHTP_FLAG_ENABLE_REUSEPORT    (1 << 1)
+    #define EVHTP_FLAG_ENABLE_NODELAY      (1 << 2)
+    #define EVHTP_FLAG_ENABLE_DEFER_ACCEPT (1 << 3)
     #define EVHTP_FLAG_DEFAULTS            EVHTP_FLAG_ENABLE_100_CONT
     #define EVHTP_FLAG_ENABLE_ALL          EVHTP_FLAG_ENABLE_100_CONT \
         | EVHTP_FLAG_ENABLE_REUSEPORT                                 \
@@ -427,13 +427,13 @@ struct evhtp_request {
     evhtp_proto          proto;         /**< HTTP protocol used */
     htp_method           method;        /**< HTTP method used */
     evhtp_res            status;        /**< The HTTP response code or other error conditions */
-    #define EVHTP_REQ_FLAG_KEEPALIVE        (1 << 1)
-    #define EVHTP_REQ_FLAG_FINISHED         (1 << 2)
-    #define EVHTP_REQ_FLAG_CHUNKED          (1 << 3)
-    #define EVHTP_REQ_FLAG_ERROR            (1 << 4)
-    #define EVHTP_REQ_FLAG_HDRS_START       (1 << 5)
-    #define EVHTP_REQ_FLAG_END_STREAM       (1 << 6)
-    #define EVHTP_REQ_FLAG_VHOST_RESOLVED   (1 << 7)
+    #define EVHTP_REQ_FLAG_KEEPALIVE        (1 << 0)
+    #define EVHTP_REQ_FLAG_FINISHED         (1 << 1)
+    #define EVHTP_REQ_FLAG_CHUNKED          (1 << 2)
+    #define EVHTP_REQ_FLAG_ERROR            (1 << 3)
+    #define EVHTP_REQ_FLAG_HDRS_START       (1 << 4)
+    #define EVHTP_REQ_FLAG_END_STREAM       (1 << 5)
+    #define EVHTP_REQ_FLAG_VHOST_RESOLVED   (1 << 6)
     uint16_t flags;
 
     int32_t           stream_id;        /**< 0 for HTTP/1, nghttp2 stream ID for HTTP/2 */
@@ -470,15 +470,15 @@ struct evhtp_connection {
     uint64_t          body_bytes_read;
     uint64_t          num_requests;
     evhtp_type        type;                        /**< server or client */
-    #define EVHTP_CONN_FLAG_ERROR         (1 << 1)
-    #define EVHTP_CONN_FLAG_OWNER         (1 << 2) /**< set to 1 if this structure owns the bufferevent */
-    #define EVHTP_CONN_FLAG_VHOST_VIA_SNI (1 << 3) /**< set to 1 if the vhost was found via SSL SNI */
-    #define EVHTP_CONN_FLAG_PAUSED        (1 << 4) /**< this connection has been marked as paused */
-    #define EVHTP_CONN_FLAG_CONNECTED     (1 << 5) /**< client specific - set after successful connection */
-    #define EVHTP_CONN_FLAG_WAITING       (1 << 6) /**< used to make sure resuming happens AFTER sending a reply */
-    #define EVHTP_CONN_FLAG_FREE_CONN     (1 << 7)
-    #define EVHTP_CONN_FLAG_KEEPALIVE     (1 << 8) /**< set to 1 after the first request has been processed and the connection is kept open */
-    #define EVHTP_CONN_FLAG_IS_HTTP2      (1 << 9) /**< connection is handling http2 traffic */
+    #define EVHTP_CONN_FLAG_ERROR         (1 << 0)
+    #define EVHTP_CONN_FLAG_OWNER         (1 << 1) /**< set to 1 if this structure owns the bufferevent */
+    #define EVHTP_CONN_FLAG_VHOST_VIA_SNI (1 << 2) /**< set to 1 if the vhost was found via SSL SNI */
+    #define EVHTP_CONN_FLAG_PAUSED        (1 << 3) /**< this connection has been marked as paused */
+    #define EVHTP_CONN_FLAG_CONNECTED     (1 << 4) /**< client specific - set after successful connection */
+    #define EVHTP_CONN_FLAG_WAITING       (1 << 5) /**< used to make sure resuming happens AFTER sending a reply */
+    #define EVHTP_CONN_FLAG_FREE_CONN     (1 << 6)
+    #define EVHTP_CONN_FLAG_KEEPALIVE     (1 << 7) /**< set to 1 after the first request has been processed and the connection is kept open */
+    #define EVHTP_CONN_FLAG_IS_HTTP2      (1 << 8) /**< connection is handling http2 traffic */
     uint16_t flags;
 
     struct evbuffer * scratch_buf;                 /**< always zero'd out after used */
@@ -1100,6 +1100,8 @@ EVHTP_EXPORT const char * evhtp_kv_find_n(evhtp_kvs_t * kvs, const char * key, s
 EVHTP_EXPORT evhtp_kv_t * evhtp_kvs_find_kv(evhtp_kvs_t * kvs, const char * key);
 EVHTP_EXPORT evhtp_kv_t * evhtp_kvs_find_kv_n(evhtp_kvs_t * kvs, const char * key, size_t len);
 
+EVHTP_EXPORT int evhtp_kvs_count_kv(evhtp_kvs_t * kvs, const char * key);
+EVHTP_EXPORT int evhtp_kvs_count_kv_n(evhtp_kvs_t * kvs, const char * key, size_t len);
 
 /**
  * @brief appends a key/val structure to a evhtp_kvs_t tailq
@@ -1242,6 +1244,8 @@ EVHTP_EXPORT void evhtp_collapse_headers(evhtp_headers_t * headers, const char *
 
 #define evhtp_headers_find_header   evhtp_kvs_find_kv
 #define evhtp_headers_find_header_n evhtp_kvs_find_kv_n
+#define evhtp_headers_count         evhtp_kvs_count_kv
+#define evhtp_headers_count_n       evhtp_kvs_count_kv_n
 #define evhtp_headers_for_each      evhtp_kvs_for_each
 #define evhtp_header_free           evhtp_kv_free
 #define evhtp_headers_new           evhtp_kvs_new

@@ -3,13 +3,7 @@
 
 #include <stdbool.h>
 #include <stdint.h>
-#include <stdlib.h>
-
-typedef struct htp_string htp_string_t;
-struct htp_string {
-    const char * startp;
-    size_t len;
-};
+#include "evhtp/string.h"
 
 typedef struct uri_field_data uri_field_data_t;
 struct uri_field_data {
@@ -44,7 +38,7 @@ struct parsed_uri {
     uint16_t flags;
 };
 
-struct parsed_uri parse_uri_view(const htp_string_t uri_string, bool is_connect);
+struct parsed_uri parse_uri_view(const htstring_t uri_string, bool is_connect);
 
 /**
  * Get the |authority| (section that comes after the scheme and before the path.
@@ -52,7 +46,7 @@ struct parsed_uri parse_uri_view(const htp_string_t uri_string, bool is_connect)
  *
  * [userinfo@]host[:port]
  */
-htp_string_t parsed_uri_get_authority(const char* p,
+htstring_t parsed_uri_get_authority(const char* p,
                                         const struct parsed_uri* u);
 
 /**
@@ -60,14 +54,14 @@ htp_string_t parsed_uri_get_authority(const char* p,
  *
  * host[:port]
  */
-htp_string_t parsed_uri_get_host_port(const char* p,
+htstring_t parsed_uri_get_host_port(const char* p,
                                                 const struct parsed_uri* u);
-char* parsed_uri_join(const htp_string_t scheme,
-                        const htp_string_t userinfo,
-                        const htp_string_t host_port,
-                        const htp_string_t path,
-                        const htp_string_t query,
-                        const htp_string_t fragment);
+char* parsed_uri_join(const htstring_t scheme,
+                        const htstring_t userinfo,
+                        const htstring_t host_port,
+                        const htstring_t path,
+                        const htstring_t query,
+                        const htstring_t fragment);
 char* parsed_uri_to_cstr(const char* p, const struct parsed_uri* u);
 
 static inline bool
@@ -124,10 +118,10 @@ parsed_uri_is_authority_form(const struct parsed_uri* u)
     return u ? !!(u->flags & URI_IS_AUTHORITY_FORM) : false;
 }
 
-static inline htp_string_t
+static inline htstring_t
 parsed_uri_get_scheme(const char* p, const struct parsed_uri* u)
 {
-    htp_string_t rval = {
+    htstring_t rval = {
         .startp = p,
         .len = 0
     };
@@ -142,10 +136,10 @@ parsed_uri_get_scheme(const char* p, const struct parsed_uri* u)
 /**
  * Get the host name component (name or IP address) - NOT including the port.
  */
-static inline htp_string_t
+static inline htstring_t
 parsed_uri_get_host(const char* p, const struct parsed_uri* u)
 {
-    htp_string_t rval = {
+    htstring_t rval = {
         .startp = p,
         .len = 0
     };
@@ -163,10 +157,10 @@ parsed_uri_get_port(const char* p, const struct parsed_uri* u)
     return parsed_uri_has_port(u) ? (int)u->port_num : -1;
 }
 
-static inline htp_string_t
+static inline htstring_t
 parsed_uri_get_user_info(const char* p, const struct parsed_uri* u)
 {
-    htp_string_t rval = {
+    htstring_t rval = {
         .startp = p,
         .len = 0
     };
@@ -178,10 +172,10 @@ parsed_uri_get_user_info(const char* p, const struct parsed_uri* u)
     return rval;
 }
 
-static inline htp_string_t
+static inline htstring_t
 parsed_uri_get_path(const char* p, const struct parsed_uri* u)
 {
-    htp_string_t rval = {
+    htstring_t rval = {
         .startp = p,
         .len = 0
     };
@@ -193,10 +187,10 @@ parsed_uri_get_path(const char* p, const struct parsed_uri* u)
     return rval;
 }
 
-static inline htp_string_t
+static inline htstring_t
 parsed_uri_get_query(const char* p, const struct parsed_uri* u)
 {
-    htp_string_t rval = {
+    htstring_t rval = {
         .startp = p,
         .len = 0
     };
@@ -208,10 +202,10 @@ parsed_uri_get_query(const char* p, const struct parsed_uri* u)
     return rval;
 }
 
-static inline htp_string_t
+static inline htstring_t
 parsed_uri_get_fragment(const char* p, const struct parsed_uri* u)
 {
-    htp_string_t rval = {
+    htstring_t rval = {
         .startp = p,
         .len = 0
     };

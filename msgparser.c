@@ -1,39 +1,36 @@
-
 #include <stdbool.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
 #include <ctype.h>
 #include <limits.h>
 #include <strings.h>
+#include <sys/types.h>
 #include <time.h>
 
 //#define EVHTP_DEBUG 1
 //#define WITH_BULK_TEST
 
 #include "evhtp/config.h"
+#include "evhtp/string.h"
+#include "evhtp/tokenizer.h"
 #include "evhtp/parsed_uri.h"
+#include "evhtp/parser.h"
+#ifdef WITH_BULK_TEST
+#undef EVHTP_DEBUG
+#endif
 #include "internal.h"
 #include "evhtp/msgparser.h"
 
-#define update_cursor_nread(s, n) do { \
-    (s)->len -= (n); \
-    (s)->startp += (n);\
-} while (0)
+/* NGINX inspired integer HTTP version strategy. */
+#define HTTP_VERSION_9 9
+#define HTTP_VERSION_10 1000
+#define HTTP_VERSION_11 1001
+#define HTTP_VERSION_20 2000
+#define HTTP_VERSION_30 3000
+#define HTTP_VERSION_AS_INT(s) (int)((s)->major * 1000 + (s)->minor)
 
-#define update_startp(s, l, e) do { \
-    (s) += (l); \
-    if ((s) < (e)) ++(s); \
-} while (0)
-
-#define update_cursor_skip(s, l, e) do { \
-    (s)->startp += (l); \
-    if ((s)->startp < (e)) ++(s)->startp; \
-    (s)->len = (e) - (s)->startp; \
-} while (0)
-
-#define MATCHES_NAME(k, n) \
-    match_key_name((k)->startp, (k)->len, (n), sizeof(n) - 1)
 
 typedef enum {
     PARSER_START = 0,
@@ -46,7 +43,7 @@ typedef enum {
     PARSER_ERROR
 } parser_state_e;
 
-static int8_t unhex[256] = {
+static const int8_t unhex[256] = {
     -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
     -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
     -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
@@ -61,13 +58,13 @@ typedef struct request_line request_line_t;
 struct request_line {
     htp_method method;
     htp_scheme scheme;
-    htp_string_t uri;
+    htstring_t uri;
 };
 
 typedef struct status_line status_line_t;
 struct status_line {
     unsigned int status_code;
-    htp_string_t status_text;
+    htstring_t status_text;
 };
 
 typedef struct head_line head_line_t;
@@ -92,6 +89,7 @@ struct chunked_decoder {
     bool end_of_chunk : 1;
     bool end_of_stream : 1;
 };
+
 static inline void
 chunked_decoder_init(chunked_decoder_t * self)
 {
@@ -103,12 +101,26 @@ chunked_decoder_init(chunked_decoder_t * self)
 }
 
 typedef size_t (* parse_data_func)(htparser *, const char *, size_t);
+
 typedef struct decoder decoder_t;
 struct decoder {
     parse_data_func parse_data;
     union {
         chunked_decoder_t chunked_decoder;
     };
+};
+
+enum {
+    HAVE_HOST             = (1 << 0),
+    HAVE_CONTENT_LENGTH   = (1 << 1),
+    HAVE_CONTENT_TYPE     = (1 << 2),
+    HAVE_CONNECTION       = (1 << 3),
+    IS_CHUNKED            = (1 << 4),
+    IS_MULTIPART          = (1 << 5),
+    CONNECTION_KEEP_ALIVE = (1 << 6),
+    CONNECTION_CLOSE      = (1 << 7),
+    SKIP_BODY             = (1 << 8),
+    PAUSED                = (1 << 9)
 };
 
 struct htparser {
@@ -135,17 +147,6 @@ struct htparser {
     unsigned char major;
     unsigned char minor;
 
-    #define HAVE_HOST              (1 << 0)
-    #define HAVE_CONTENT_LENGTH    (1 << 1)
-    #define HAVE_CONTENT_TYPE      (1 << 2)
-    #define HAVE_TRANSFER_ENCODING (1 << 3)
-    #define HAVE_CONNECTION        (1 << 4)
-    #define IS_CHUNKED             (1 << 5)
-    #define IS_MUTLIPART           (1 << 6)
-    #define CONNECTION_KEEP_ALIVE  (1 << 7)
-    #define CONNECTION_CLOSE       (1 << 8)
-    #define SKIP_BODY              (1 << 9)
-    #define PAUSED                 (1 << 10)
     uint16_t flags;
 };
 
@@ -174,6 +175,7 @@ static const char * errstr_map[] = {
 };
 
 static const char * method_strmap[] = {
+    "UNKNOWN",
     "GET",
     "HEAD",
     "POST",
@@ -192,49 +194,47 @@ static const char * method_strmap[] = {
     "PATCH",
 };
 
-#define __HTPARSE_GENHOOK(__n)                                                    \
-    static inline int hook_ ## __n ## _run(htparser * p, htparse_hooks * hooks) { \
-        log_debug("enter");                                                       \
-        if (hooks && (hooks)->__n)                                                \
-        {                                                                         \
-            return (hooks)->__n(p);                                               \
-        }                                                                         \
-                                                                                  \
-        return 0;                                                                 \
+#define HTPARSE_GENHOOK(__n)                                                   \
+    static inline int hook_ ## __n ## _run(htparser * p, htparse_hooks * hooks) {\
+        log_debug("enter");                                                    \
+        if (hooks && (hooks)->__n)                                             \
+        {                                                                      \
+            return (hooks)->__n(p);                                            \
+        }                                                                      \
+        return 0;                                                              \
     }
 
-#define __HTPARSE_GENDHOOK(__n)                                        \
-    static inline int hook_ ## __n ## _run(htparser * p,               \
-                                           htparse_hooks * hooks,      \
-                                           const char * s, size_t l) { \
-        log_debug("enter");                                            \
-        if (hooks && (hooks)->__n)                                     \
-        {                                                              \
-            return (hooks)->__n(p, s, l);                              \
-        }                                                              \
-                                                                       \
-        return 0;                                                      \
+#define HTPARSE_GENDHOOK(__n)                                        \
+    static inline int hook_ ## __n ## _run(htparser * p,             \
+                                           htparse_hooks * hooks,    \
+                                           const char * s, size_t l) {\
+        log_debug("enter");                                         \
+        if (hooks && (hooks)->__n)                                  \
+        {                                                           \
+            return (hooks)->__n(p, s, l);                           \
+        }                                                           \
+        return 0;                                                   \
     }
 
-__HTPARSE_GENHOOK(on_msg_begin)
-__HTPARSE_GENHOOK(on_hdrs_begin)
-__HTPARSE_GENHOOK(on_hdrs_complete)
-__HTPARSE_GENHOOK(on_new_chunk)
-__HTPARSE_GENHOOK(on_chunk_complete)
-__HTPARSE_GENHOOK(on_chunks_complete)
-__HTPARSE_GENHOOK(on_msg_complete)
+HTPARSE_GENHOOK(on_msg_begin)
+HTPARSE_GENHOOK(on_hdrs_begin)
+HTPARSE_GENHOOK(on_hdrs_complete)
+HTPARSE_GENHOOK(on_new_chunk)
+HTPARSE_GENHOOK(on_chunk_complete)
+HTPARSE_GENHOOK(on_chunks_complete)
+HTPARSE_GENHOOK(on_msg_complete)
 
-__HTPARSE_GENDHOOK(method)
-__HTPARSE_GENDHOOK(scheme)
-__HTPARSE_GENDHOOK(host)
-__HTPARSE_GENDHOOK(port)
-__HTPARSE_GENDHOOK(path)
-__HTPARSE_GENDHOOK(args)
-__HTPARSE_GENDHOOK(uri)
-__HTPARSE_GENDHOOK(hdr_key)
-__HTPARSE_GENDHOOK(hdr_val)
-__HTPARSE_GENDHOOK(body)
-__HTPARSE_GENDHOOK(hostname)
+HTPARSE_GENDHOOK(method)
+HTPARSE_GENDHOOK(scheme)
+HTPARSE_GENDHOOK(host)
+HTPARSE_GENDHOOK(port)
+HTPARSE_GENDHOOK(path)
+HTPARSE_GENDHOOK(args)
+HTPARSE_GENDHOOK(uri)
+HTPARSE_GENDHOOK(hdr_key)
+HTPARSE_GENDHOOK(hdr_val)
+HTPARSE_GENDHOOK(body)
+HTPARSE_GENDHOOK(hostname)
 
 htparser *
 htparser_new_(const htp_http1config_t * config)
@@ -246,7 +246,6 @@ htparser_new_(const htp_http1config_t * config)
     {
         self->config = config ? config : &default_config;
         self->state = PARSER_START;
-        self->header_count = 0;
         log_debug("self %p, %zu bytes", self, sizeof(*self));
     }
     return self;
@@ -274,6 +273,9 @@ htparser_init(htparser * self, htp_type type)
 {
     log_debug("(%p, %d)", self, type);
     self->type = type;
+    /* stack-allocated parsers have no config yet; override afterwards
+     * with htparser_set_http1config() if needed */
+    self->config = &default_config;
     htparser_reset(self);
 }
 
@@ -283,18 +285,43 @@ htparser_reset(htparser * self)
     log_debug("(%p)", self);
     if (self)
     {
-        htp_type type = self->type;
         self->state = PARSER_START;
         self->error = htparse_error_none;
         self->flags = 0;
         self->content_len = 0;
         self->orig_content_len = 0;
+        self->header_count = 0;
         self->empty_line_count = 0;
         self->major = 0;
         self->minor = 0;
         self->decoder.parse_data = NULL;
         memset(&self->head_line, 0, sizeof(self->head_line));
     }
+}
+
+static inline bool
+can_response_have_body(int status)
+{
+    return status >= 200      // success
+            && status != 204  // no content
+            && status != 304; // not modified
+}
+
+/*
+ * No Content-Length and no chunked Transfer-Encoding.
+ * For responses this may be an identity (read-until-
+ * connection-close) body.
+ *
+ * Mirroring the logic in nodejs/http-parser.
+ */
+static inline bool
+is_identity_response(htparser * p)
+{
+    return p->type == htp_type_response
+            && !(p->flags & SKIP_BODY)
+            && HTTP_VERSION_AS_INT(p) < HTTP_VERSION_11
+            && !(p->flags & CONNECTION_KEEP_ALIVE)
+            && can_response_have_body(p->head_line.status_line.status_code);
 }
 
 static inline uint64_t
@@ -343,12 +370,15 @@ str_to_uint64(const char * str, size_t n, int * err)
 static inline int
 lc(int c)
 {
-    return c | 0x20; /* lowercases ASCII letters; harmless on digits/punct here since we control both sides */
+    return c | 0x20;
 }
 
 static inline htp_method
-get_method(const htp_string_t * method)
+get_method(const htstring_t * method)
 {
+    if (method->len == 0)
+        return htp_method_UNKNOWN;
+
     const unsigned char * s = (const unsigned char *)method->startp;
     int c = lc(s[0]);
 
@@ -417,86 +447,116 @@ get_method(const htp_string_t * method)
 static inline const char *
 skip_white_space(const char * startp, const char * endp)
 {
-    while (startp < endp && isspace(startp[0])) ++startp;
+    while (startp < endp && htstring_is_whitespace((unsigned char)startp[0]))
+        ++startp;
     return startp;
 }
 
 static inline const char *
 find_blank(const char * startp, const char * endp)
 {
-    while (startp < endp && !isblank(startp[0])) ++startp;
+    while (startp < endp && !isblank((unsigned char)startp[0])) ++startp;
     return startp;
 }
 
+/* Advance cursor past the line ending at *eol ('\n'); set *eol to the
+ * end of the line CONTENT (back over the '\r' if present), so the
+ * caller's [startp, eol) excludes the CRLF. */
 static inline void
-update_cursor_eol(htp_string_t * self, const char ** eol)
+update_cursor_eol(htstring_t * self, const char ** eol)
 {
-    const char * eol_ = *eol;
-    size_t len = eol_ - self->startp;
-    ++eol_; // skip '\n'
-    self->len -= eol_ - self->startp;
-    self->startp = eol_;
-    if (len > 0 && (*eol)[-1] == '\r') --(*eol);
+    const char * nl       = *eol;                /* at '\n' */
+    const char * line_end = nl;
+
+    if (line_end > self->startp && line_end[-1] == '\r')
+        --line_end;
+
+    *eol = line_end;
+
+    /* consume the full content + CRLF (or LF) */
+    htstring_consume(self, (size_t)(nl - self->startp) + 1);
 }
 
-static inline htp_string_t
-parse_method(htp_string_t * cursor)
+static inline bool
+line_too_long(const htstring_t * cursor, const char * eol, size_t max_line_length)
+{
+    if (max_line_length == 0)
+        return false;
+    if (!eol)
+        return cursor->len > max_line_length;
+    return (size_t)(eol - cursor->startp) > max_line_length;
+}
+
+static inline htstring_t
+parse_method(htstring_t * cursor)
 {
     log_debug("(%p)", cursor);
-    const char * endp = cursor->startp + cursor->len;
+
+    const char * endp   = htstring_end(*cursor);
     const char * startp = skip_white_space(cursor->startp, endp);
-    htp_string_t rval = {
+
+    htstring_t rval = {
         .startp = startp,
-        .len = find_blank(startp, endp) - startp
+        .len    = (size_t)(find_blank(startp, endp) - startp)
     };
-    update_cursor_skip(cursor, rval.len, endp);
-    cursor->len = endp - cursor->startp;
+
+    htstring_advance(cursor, rval);   /* just past token + one blank */
     return rval;
 }
 
-static inline htp_string_t
-parse_request_uri(htp_string_t * cursor)
+static inline htstring_t
+parse_request_uri(htstring_t * cursor)
 {
     log_debug("(%p)", cursor);
-    const char * endp = cursor->startp + cursor->len;
+
+    const char * endp   = htstring_end(*cursor);
     const char * startp = skip_white_space(cursor->startp, endp);
-    htp_string_t rval = {
+
+    htstring_t rval = {
         .startp = startp,
-        .len = find_blank(startp, endp) - startp
+        .len    = (size_t)(find_blank(startp, endp) - startp)
     };
-    update_cursor_skip(cursor, rval.len, endp);
+
+    htstring_advance(cursor, rval);
     return rval;
 }
 
-static inline htp_string_t
+static inline htstring_t
 parse_header_key(const char * startp, const char * endp)
 {
     log_debug("(%p, %p)", startp, endp);
+
     startp = skip_white_space(startp, endp);
 
-    const char * colonp = memchr(startp, ':', endp - startp);
-    return (htp_string_t){
-        .startp = startp,
-        .len = colonp ? colonp - startp : 0
-    };
+    const char * colonp = memchr(startp, ':', (size_t)(endp - startp));
+
+    htstring_t key = { .startp = startp, .len = 0 };
+    if (colonp)
+        key.len = (size_t)(colonp - startp);
+    return key;
 }
 
-static inline htp_string_t
+static inline htstring_t
 parse_header_val(const char * startp, const char * endp)
 {
     log_debug("(%p, %p)", startp, endp);
+
     startp = skip_white_space(startp, endp);
-    while (endp > startp && isspace(endp[-1])) --endp;
-    return (htp_string_t){
+    while (endp > startp && isspace((unsigned char)endp[-1])) --endp;
+
+    return (htstring_t){
         .startp = startp,
-        .len = endp - startp
+        .len    = (size_t)(endp - startp)
     };
 }
 
 static inline bool
-parse_version_number(const htp_string_t * ver, unsigned char * major, unsigned char * minor)
+parse_version_number(const htstring_t * ver, unsigned char * major, unsigned char * minor)
 {
     log_debug("(%p(%.*s), %p, %p)", ver, (int)ver->len, ver->startp, major, minor);
+
+    if (ver->len != 3)
+        return false;
 
     const char * startp = ver->startp;
 
@@ -506,8 +566,7 @@ parse_version_number(const htp_string_t * ver, unsigned char * major, unsigned c
         return false;
     }
 
-    *major = startp[0] - '0';
-
+    *major = (unsigned char)(startp[0] - '0');
     ++startp;
 
     if (startp[0] != '.')
@@ -515,7 +574,6 @@ parse_version_number(const htp_string_t * ver, unsigned char * major, unsigned c
         log_debug("invalid protocol version number");
         return false;
     }
-
     ++startp;
 
     if (startp[0] < '0' || startp[0] > '9')
@@ -524,74 +582,60 @@ parse_version_number(const htp_string_t * ver, unsigned char * major, unsigned c
         return false;
     }
 
-    *minor = startp[0] - '0';
+    *minor = (unsigned char)(startp[0] - '0');
 
     return true;
 }
 
-static inline htp_string_t
-parse_protocol_version(htp_string_t * cursor)
+static inline htstring_t
+parse_protocol_version(htstring_t * cursor)
 {
-    static htp_string_t protoname = {
-        .startp = "HTTP",
-        .len = 4
-    };
+    static const htstring_t protoname = HTSTRING_LIT("HTTP");
+
     log_debug("(%p)", cursor);
 
-    const char * endp = cursor->startp + cursor->len;
+    const char * endp   = htstring_end(*cursor);
     const char * startp = skip_white_space(cursor->startp, endp);
 
-    htp_string_t ver = {
-        .startp = startp,
-        .len = 0
-    };
+    htstring_t ver = { .startp = startp, .len = 0 };
 
-    size_t bytes_left = endp - startp;
-    if (protoname.len + 4 > bytes_left)
+    size_t bytes_left = (size_t)(endp - startp);
+    if (protoname.len + 4 > bytes_left)   /* "HTTP" + "/" + d "." d */
     {
         log_debug("invalid protocol version");
         return ver;
     }
 
-    for (size_t i = 0; i < protoname.len; ++i, ++startp)
-    {
-        if (startp[0] != protoname.startp[i])
-        {
-            log_debug("invalid protocol version");
-            return ver;
-        }
-    }
-
-    if (startp[0] != '/')
+    if (memcmp(startp, protoname.startp, protoname.len) != 0)
     {
         log_debug("invalid protocol version");
         return ver;
     }
 
-    ++startp;
+    if (startp[4] != '/')
+    {
+        log_debug("invalid protocol version");
+        return ver;
+    }
 
-    htp_string_t rval = {
-        .startp = startp,
-        .len = 3
-    };
+    ver.startp = startp + 5;
+    ver.len    = 3;
 
-    update_cursor_nread(cursor, startp - cursor->startp);
-    cursor->len = endp - cursor->startp;
+    htstring_advance(cursor, ver);   /* "HTTP/x.y" + one blank if present */
 
-    return rval;
+    return ver;
 }
 
 static inline unsigned int
-parse_status_code(htp_string_t * cursor)
+parse_status_code(htstring_t * cursor)
 {
     log_debug("(%p)", cursor);
 
-    const char * endp = cursor->startp + cursor->len;
+    const char * endp   = htstring_end(*cursor);
     const char * startp = skip_white_space(cursor->startp, endp);
+    size_t       avail  = (size_t)(endp - startp);
 
-    size_t bytes_left = endp - startp;
-
-    if (bytes_left < 3)
+    if (avail < 3)
     {
         log_debug("invalid status code");
         return 0;
@@ -602,51 +646,53 @@ parse_status_code(htp_string_t * cursor)
     for (int i = 0; i < 3; ++i)
     {
         char c = startp[i];
-
         if (c < '0' || c > '9')
         {
             log_debug("invalid status code");
             return 0;
         }
-
         status_code = (status_code * 10) + (unsigned)(c - '0');
     }
 
-    /* reject a 4th digit — status-code is exactly 3 digits per RFC 9112 */
-    if (bytes_left > 3 && startp[3] >= '0' && startp[3] <= '9')
+    /* status-code is exactly 3 digits (RFC 9112) */
+    if (avail > 3 && startp[3] >= '0' && startp[3] <= '9')
     {
         log_debug("invalid status code (too many digits)");
         return 0;
     }
 
-    update_cursor_skip(cursor, 3, endp);
+    /* mandatory single-SP separator before reason-phrase, validated
+     * at its source position BEFORE anything is consumed */
+    if (avail > 3 && startp[3] != ' ')
+    {
+        log_debug("invalid status code (missing SP)");
+        return 0;
+    }
+
+    htstring_t code = { .startp = startp, .len = 3 };
+    htstring_advance(cursor, code);   /* digits + the SP, if present */
 
     return status_code;
 }
 
-static inline htp_string_t
-parse_status_text(htp_string_t * cursor)
+static inline htstring_t
+parse_status_text(htstring_t * cursor)
 {
     log_debug("(%p)", cursor);
 
-    const char * endp = cursor->startp + cursor->len;
+    const char * endp   = htstring_end(*cursor);
     const char * startp = skip_white_space(cursor->startp, endp);
 
-    htp_string_t rval = {
+    /* last field on the line; no advance needed */
+    return (htstring_t){
         .startp = startp,
-        .len = endp - startp
+        .len    = (size_t)(endp - startp)
     };
-
-    update_cursor_skip(cursor, rval.len, endp);
-
-    return rval;
 }
 
 static inline bool
 is_valid_scheme_start(const char * startp)
 {
-    log_debug("(%p)", startp);
-
     unsigned char c = (unsigned char)(startp[0] | 0x20);
     return c >= 'a' && c <= 'z';
 }
@@ -691,21 +737,19 @@ is_https_scheme(const char * startp, size_t len)
 }
 
 static inline htp_scheme
-get_scheme_type(const htp_string_t * scheme)
+get_scheme_type(const htstring_t * scheme)
 {
     if (is_http_scheme(scheme->startp, scheme->len))
         return htp_scheme_http;
-    else if (is_https_scheme(scheme->startp, scheme->len))
+    if (is_https_scheme(scheme->startp, scheme->len))
         return htp_scheme_https;
-    else if (is_ftp_scheme(scheme->startp, scheme->len))
+    if (is_ftp_scheme(scheme->startp, scheme->len))
         return htp_scheme_ftp;
-    else if (is_nfs_scheme(scheme->startp, scheme->len))
+    if (is_nfs_scheme(scheme->startp, scheme->len))
         return htp_scheme_nfs;
-    else
-    {
-        log_debug("invalid scheme name \"%.*s\"", (int)scheme->len, scheme->startp);
-        return htp_scheme_unknown;
-    }
+
+    log_debug("invalid scheme name \"%.*s\"", (int)scheme->len, scheme->startp);
+    return htp_scheme_unknown;
 }
 
 static bool
@@ -713,7 +757,7 @@ emit_host_port(htparser * self, const char * startp, struct parsed_uri * u)
 {
     log_debug("(%p, %p, %p)", self, startp, u);
 
-    htp_string_t host = parsed_uri_get_host(startp, u);
+    htstring_t host = parsed_uri_get_host(startp, u);
     if (hook_host_run(self, self->hooks, host.startp, host.len))
     {
         self->error = htparse_error_user;
@@ -722,15 +766,21 @@ emit_host_port(htparser * self, const char * startp, struct parsed_uri * u)
 
     if (parsed_uri_has_port(u))
     {
-        htp_string_t host_port = parsed_uri_get_host_port(startp, u);
-        const char * startp = host_port.startp;
-        while (startp[0] != ':') ++startp;
-        ++startp;
-        update_cursor_nread(&host_port, startp - host_port.startp);
-        if (hook_port_run(self, self->hooks, host_port.startp, host_port.len))
+        htstring_t host_port = parsed_uri_get_host_port(startp, u);
+        const char * portp = memchr(host_port.startp, ':', host_port.len);
+
+        if (portp)
         {
-            self->error = htparse_error_user;
-            return false;
+            htstring_t port = {
+                .startp = portp + 1,
+                .len    = (size_t)(htstring_end(host_port) - (portp + 1))
+            };
+
+            if (hook_port_run(self, self->hooks, port.startp, port.len))
+            {
+                self->error = htparse_error_user;
+                return false;
+            }
         }
     }
 
@@ -738,22 +788,23 @@ emit_host_port(htparser * self, const char * startp, struct parsed_uri * u)
 }
 
 static bool
-consume_uri(htparser * self, request_line_t * request_line, const htp_string_t * uri, bool is_connect)
+consume_uri(htparser * self, request_line_t * request_line, const htstring_t * uri, bool is_connect)
 {
     log_debug("(%p, %p, %p(%.*s), %u)", self, request_line, uri, (int)uri->len, uri->startp, is_connect);
 
     request_line->scheme = htp_scheme_unknown;
 
     const char * startp = uri->startp;
+
     if (startp[0] == '/')
     {
-        const char * endp = startp + uri->len;
-        const char * curp = memchr(startp, '?', endp - startp);
-        const char * args = curp ? curp + 1 : NULL;
+        const char * endp     = htstring_end(*uri);
+        const char * curp     = memchr(startp, '?', uri->len);
+        const char * args     = curp ? curp + 1 : NULL;
         const char * pathendp = curp ? curp : endp;
 
-        if (hook_path_run(self, self->hooks, startp, pathendp - startp) ||
-            (args && hook_args_run(self, self->hooks, args, endp - args)))
+        if (hook_path_run(self, self->hooks, startp, (size_t)(pathendp - startp)) ||
+            (args && hook_args_run(self, self->hooks, args, (size_t)(endp - args))))
         {
             self->error = htparse_error_user;
             return false;
@@ -775,7 +826,7 @@ consume_uri(htparser * self, request_line_t * request_line, const htp_string_t *
             return false;
         }
 
-        if (parsed_uri_is_authority_form(&u))
+        if (parsed_uri_is_authority_form(&u))   /* Likely CONNECT request. */
         {
             if (!emit_host_port(self, startp, &u))
             {
@@ -797,7 +848,7 @@ consume_uri(htparser * self, request_line_t * request_line, const htp_string_t *
         }
         else
         {
-            htp_string_t scheme = parsed_uri_get_scheme(startp, &u);
+            htstring_t scheme = parsed_uri_get_scheme(startp, &u);
             htp_scheme scheme_type = get_scheme_type(&scheme);
             if (scheme_type == htp_scheme_unknown)
             {
@@ -818,7 +869,7 @@ consume_uri(htparser * self, request_line_t * request_line, const htp_string_t *
                 return false;
             }
 
-            htp_string_t path = parsed_uri_get_path(startp, &u);
+            htstring_t path = parsed_uri_get_path(startp, &u);
             if (hook_path_run(self, self->hooks, path.startp, path.len))
             {
                 self->error = htparse_error_user;
@@ -827,7 +878,7 @@ consume_uri(htparser * self, request_line_t * request_line, const htp_string_t *
 
             if (parsed_uri_has_query(&u))
             {
-                htp_string_t args = parsed_uri_get_query(startp, &u);
+                htstring_t args = parsed_uri_get_query(startp, &u);
                 if (hook_args_run(self, self->hooks, args.startp, args.len))
                 {
                     self->error = htparse_error_user;
@@ -853,23 +904,21 @@ parse_request_line(htparser * self, const char * startp, const char * endp)
 
     request_line_t * request_line = &self->head_line.request_line;
 
-    htp_string_t cursor = {
+    htstring_t cursor = {
         .startp = startp,
-        .len = endp - startp
+        .len    = (size_t)(endp - startp)
     };
 
-    htp_string_t method = parse_method(&cursor);
+    htstring_t method = parse_method(&cursor);
+log_debug("\"%.*s\"", (int)method.len, method.startp);
     htp_method method_num = get_method(&method);
+log_debug("method num %d", method_num);
     if (method_num == htp_method_UNKNOWN)
     {
         self->error = htparse_error_inval_method;
         return false;
     }
     request_line->method = method_num;
-if (method_num == htp_method_CONNECT)
-{
-    log_debug("connect method\n\"%.*s\"", (int)(endp - startp), startp);
-}
 
     if (hook_method_run(self, self->hooks, method.startp, method.len))
     {
@@ -877,13 +926,15 @@ if (method_num == htp_method_CONNECT)
         return false;
     }
 
-    htp_string_t uri = parse_request_uri(&cursor);
+    htstring_t uri = parse_request_uri(&cursor);
     if (!uri.len)
     {
         self->error = htparse_error_inval_reqline;
         return false;
     }
-log_debug("uri \"%.*s\"", (int)uri.len, uri.startp);
+
+    log_debug("uri \"%.*s\"", (int)uri.len, uri.startp);
+
     if (!consume_uri(self, request_line, &uri, method_num == htp_method_CONNECT))
     {
         log_debug("failed");
@@ -891,7 +942,7 @@ log_debug("uri \"%.*s\"", (int)uri.len, uri.startp);
     }
     request_line->uri = uri;
 
-    htp_string_t ver = parse_protocol_version(&cursor);
+    htstring_t ver = parse_protocol_version(&cursor);
     if (!ver.len)
     {
         self->error = htparse_error_inval_ver;
@@ -914,12 +965,12 @@ parse_status_line(htparser * self, const char * startp, const char * endp)
 
     status_line_t * status_line = &self->head_line.status_line;
 
-    htp_string_t cursor = {
+    htstring_t cursor = {
         .startp = startp,
-        .len = endp - startp
+        .len    = (size_t)(endp - startp)
     };
 
-    htp_string_t ver = parse_protocol_version(&cursor);
+    htstring_t ver = parse_protocol_version(&cursor);
     if (!ver.len)
     {
         self->error = htparse_error_inval_ver;
@@ -932,7 +983,8 @@ parse_status_line(htparser * self, const char * startp, const char * endp)
         return false;
     }
 
-    update_cursor_nread(&cursor, 3);
+    /* NOTE: no manual skip here — parse_protocol_version's advance
+     * consumed the full "HTTP/x.y" token plus its SP. */
 
     unsigned int status_code = parse_status_code(&cursor);
     if (!status_code)
@@ -941,12 +993,6 @@ parse_status_line(htparser * self, const char * startp, const char * endp)
         return false;
     }
     status_line->status_code = status_code;
-
-    if (cursor.startp < endp && !isspace(cursor.startp[0]))
-    {
-        self->error = htparse_error_status;
-        return false;
-    }
 
     status_line->status_text = parse_status_text(&cursor);
 
@@ -971,42 +1017,86 @@ parse_head_line(htparser * self, const char * startp, const char * endp)
         parse_status_line(self, startp, endp);
 }
 
-static inline int
-match_key_name(const char * startp, size_t klen, const char * name, size_t nlen)
+static inline bool
+is_known_coding(const htstring_t coding)
 {
-    if (klen != nlen)
-    {
-        return 0;
-    }
+    return htstring_equalsi(coding, HTSTRING_LIT("compress")) ||
+            htstring_equalsi(coding, HTSTRING_LIT("deflate")) ||
+            htstring_equalsi(coding, HTSTRING_LIT("gzip"));
+}
 
-    for (size_t i = 0; i < nlen; i++)
+/* returns 0 = valid framing, non-zero = reject (400) */
+static int
+validate_transfer_encoding(htstring_t header_value, bool * unknown_coding, bool * is_chunked)
+{
+    log_debug("(\"%.*s\", %p, %p)", (int)header_value.len, header_value.startp, unknown_coding, is_chunked);
+
+    ht_element_iter_t it = ht_element_iter_ctor(header_value);
+
+    ht_element_t el;
+    ht_element_t last;
+    unsigned count = 0;
+    unsigned chunked_count = 0;
+
+    while (ht_element_iter_next(&it, &el))
     {
-        if ((unsigned char)(startp[i] | 0x20) != (unsigned char)(name[i] | 0x20))
+        count++;
+        if (htstring_equalsi(el.name, HTSTRING_LIT("chunked")))
         {
-            return 0;
+            chunked_count++;
+            log_debug("chunked count %u", chunked_count);
         }
+        else if (!is_known_coding(el.name))
+        {
+            *unknown_coding = true;         /* caller maps to 501 */
+            log_debug("unknown coding \"%.*s\"", (int)el.name.len, el.name.startp);
+            return -4;
+        }
+        last = el;
     }
 
-    return 1;
+    if (count == 0)
+    {
+        log_debug("empty list");
+        return -1;   /* empty list */
+    }
+
+    if (chunked_count > 1)
+    {
+        log_debug("repeated chunked (%u times)", chunked_count);
+        return -2;   /* repeated chunked */
+    }
+
+    if (chunked_count)
+    {
+        if (!htstring_equalsi(last.name, HTSTRING_LIT("chunked")))
+        {
+            log_debug("chunked not final - potential smuggling");
+            return -3;   /* chunked not final — smuggling config */
+        }
+        *is_chunked = true;
+    }
+
+    return 0;
 }
 
 static inline bool
-consume_header(htparser * self, const htp_string_t * key, const htp_string_t * val)
+consume_header(htparser * self, const htstring_t * key, const htstring_t * val)
 {
-    static const char host_name[]         = "Host";
+    static const char host_name[]          = "Host";
     static const char content_length[]    = "Content-length";
-    static const char content_type[]      = "Content-type";
-    static const char transfer_encoding[] = "Transfer-encoding";
+    static const char content_type[]       = "Content-type";
+    static const char transfer_encoding[]  = "Transfer-encoding";
     static const char connection[]        = "Connection";
 
     static const char chunked[]           = "chunked";
     static const char close[]             = "close";
-    static const char keep_alive[]        = "keep-alive";
+    static const char keep_alive[]         = "keep-alive";
     static const char multipart[]         = "multipart";
 
     log_debug("(%p, %p, %p)", self, key, val);
 
-    // Bail out early if this is actually a trailer.
+    /* Bail out early if this is actually a trailer. */
     if (self->state != PARSER_READ_HEADERS)
     {
         log_debug("must be a trailer");
@@ -1022,7 +1112,8 @@ consume_header(htparser * self, const htp_string_t * key, const htp_string_t * v
     switch (key->len)
     {
         case sizeof(host_name) - 1:
-            if (!(self->flags & HAVE_HOST) && MATCHES_NAME(key, host_name))
+            if (!(self->flags & HAVE_HOST) &&
+                htstring_equalsi(*key, HTSTRING_LIT(host_name)))
             {
                 if (hook_hostname_run(self, self->hooks, val->startp, val->len))
                 {
@@ -1033,48 +1124,72 @@ consume_header(htparser * self, const htp_string_t * key, const htp_string_t * v
             }
             break;
         case sizeof(connection) - 1:
-            if (!(self->flags & HAVE_CONNECTION) && MATCHES_NAME(key, connection))
+            if (!(self->flags & HAVE_CONNECTION) &&
+                htstring_equalsi(*key, HTSTRING_LIT(connection)))
             {
-                if (MATCHES_NAME(val, close))
+                if (htstring_equalsi(*val, HTSTRING_LIT(close)))
                     self->flags |= CONNECTION_CLOSE;
-                else if (MATCHES_NAME(val, keep_alive))
+                else if (htstring_equalsi(*val, HTSTRING_LIT(keep_alive)))
                     self->flags |= CONNECTION_KEEP_ALIVE;
                 self->flags |= HAVE_CONNECTION;
             }
             break;
         case sizeof(content_type) - 1:
-            if (!(self->flags & HAVE_CONTENT_TYPE) && MATCHES_NAME(key, content_type))
+            if (!(self->flags & HAVE_CONTENT_TYPE) &&
+                htstring_equalsi(*key, HTSTRING_LIT(content_type)))
             {
-                htp_string_t s = *val;
+                htstring_t s = *val;
                 const char * curp = memchr(s.startp, '/', s.len);
                 if (curp)
                 {
                     log_debug("found slash");
-                    s.len = curp - s.startp;
+                    s.len = (size_t)(curp - s.startp);
                 }
-                if (MATCHES_NAME(&s, multipart)) self->flags |= IS_MUTLIPART;
+                if (htstring_equalsi(s, HTSTRING_LIT(multipart)))
+                {
+                    log_debug("multipart");
+                    self->flags |= IS_MULTIPART;
+                }
                 self->flags |= HAVE_CONTENT_TYPE;
             }
             break;
         case sizeof(content_length) - 1:
-            if (!(self->flags & HAVE_CONTENT_LENGTH) && MATCHES_NAME(key, content_length))
+            if (htstring_equalsi(*key, HTSTRING_LIT(content_length)))
             {
-                int err = 0;
-                self->content_len = str_to_uint64(val->startp, val->len, &err);
-                if (err == 1)
+                if (!(self->flags & HAVE_CONTENT_LENGTH))
                 {
-                    self->error = htparse_error_too_big;
+                    int err = 0;
+                    self->content_len = str_to_uint64(val->startp, val->len, &err);
+                    if (err == 1)
+                    {
+                        self->error = htparse_error_too_big;
+                        return false;
+                    }
+                    self->orig_content_len = self->content_len;
+                    self->flags |= HAVE_CONTENT_LENGTH;
+                }
+                else
+                {
+                    /* Multiple Content-length headers. */
+                    self->error = htparse_error_inval_hdr;
                     return false;
                 }
-                self->orig_content_len = self->content_len;
-                self->flags |= HAVE_CONTENT_LENGTH;
             }
             break;
         case sizeof(transfer_encoding) - 1:
-            if (!(self->flags & HAVE_TRANSFER_ENCODING) && MATCHES_NAME(key, transfer_encoding))
+            if (!(self->flags & IS_CHUNKED) &&
+                htstring_equalsi(*key, HTSTRING_LIT(transfer_encoding)))
             {
-                if (MATCHES_NAME(val, chunked)) self->flags |= IS_CHUNKED;
-                self->flags |= HAVE_TRANSFER_ENCODING;
+                bool unknown_coding = false;
+                bool is_chunked = false;
+                int rval = validate_transfer_encoding(*val, &unknown_coding, &is_chunked);
+                if (rval != 0)
+                {
+                    log_debug("failed %d, unknown coding %u", rval, unknown_coding);
+                    self->error = htparse_error_inval_hdr;
+                    return false;
+                }
+                if (is_chunked) self->flags |= IS_CHUNKED;
             }
             break;
         default:
@@ -1094,7 +1209,7 @@ parse_header(htparser * self, const char * startp, const char * endp)
 {
     log_debug("(%p, %p, %p)", self, startp, endp);
 
-    if (isblank(startp[0]) && self->header_count > 0)
+    if (isblank((unsigned char)startp[0]) && self->header_count > 0)
     {
         if (!self->config->allow_folding)
         {
@@ -1102,20 +1217,27 @@ parse_header(htparser * self, const char * startp, const char * endp)
             self->error = htparse_error_inval_hdr;
             return false;
         }
-        // Handle folded header line.
+        /* Handle folded header line. (not implemented) */
     }
 
-    htp_string_t key = parse_header_key(startp, endp);
-    if (!key.len || isspace(key.startp[key.len - 1]))
+    htstring_t line = {
+        .startp = startp,
+        .len    = (size_t)(endp - startp)
+    };
+
+    htstring_t key = parse_header_key(line.startp, htstring_end(line));
+    if (key.len == 0 || isspace((unsigned char)key.startp[key.len - 1]))
     {
         log_debug("invalid header");
         self->error = htparse_error_inval_hdr;
         return false;
     }
 
-    update_startp(startp, key.len, endp);
+    /* the no-colon case was rejected above (key.len == 0); the single
+     * separator byte advance() consumes here is the ':' */
+    htstring_advance(&line, key);
 
-    htp_string_t val = parse_header_val(startp, endp);
+    htstring_t val = parse_header_val(line.startp, htstring_end(line));
 
     if (!consume_header(self, &key, &val))
     {
@@ -1167,9 +1289,9 @@ parse_chunk_head(htparser * self, chunked_decoder_t * decoder, const char * data
 {
     log_debug("(%p, %p, %p, %zu)", self, decoder, data, len);
 
-    htp_string_t cursor = {
+    htstring_t cursor = {
         .startp = data,
-        .len = len
+        .len    = len
     };
 
     if (decoder->end_of_chunk)
@@ -1187,7 +1309,7 @@ parse_chunk_head(htparser * self, chunked_decoder_t * decoder, const char * data
         }
         else if (eol - startp != 1)
         {
-            log_debug("CRLF expected at end of chunk (%zu,\"%.*s\")", eol - startp, (int)(eol - startp), startp);
+            log_debug("CRLF expected at end of chunk (%zu,\"%.*s\")", (size_t)(eol - startp), (int)(eol - startp), startp);
             self->error = htparse_error_inval_chunk;
             return 0;
         }
@@ -1203,10 +1325,8 @@ parse_chunk_head(htparser * self, chunked_decoder_t * decoder, const char * data
 
     const char * startp = cursor.startp;
     const char * eol = memchr(startp, '\n', cursor.len);
-    size_t max_line_length = self->config->max_line_length;
 
-    if (max_line_length > 0 &&
-        ((!eol && cursor.len > max_line_length) || (eol && (eol - startp > max_line_length))))
+    if (line_too_long(&cursor, eol, self->config->max_line_length))
     {
         log_debug("Maximum line length limit exceeded");
         self->error = htparse_error_too_big;
@@ -1221,7 +1341,7 @@ parse_chunk_head(htparser * self, chunked_decoder_t * decoder, const char * data
 
     update_cursor_eol(&cursor, &eol);
 
-    const char * separator = memchr(startp, ';', eol - startp);
+    const char * separator = memchr(startp, ';', (size_t)(eol - startp));
     decoder->chunk_size = parse_chunk_size(startp, separator ? separator : eol);
     if (decoder->chunk_size == -1L)
     {
@@ -1230,7 +1350,7 @@ parse_chunk_head(htparser * self, chunked_decoder_t * decoder, const char * data
         return len - cursor.len;
     }
 
-    self->content_len = decoder->chunk_size;
+    self->content_len = (uint64_t)decoder->chunk_size;
 
     return len - cursor.len;
 }
@@ -1241,9 +1361,9 @@ parse_chunked(htparser * self, const char * data, size_t len)
     log_debug("(%p, %p, %zu)", self, data, len);
 
     chunked_decoder_t * decoder = &self->decoder.chunked_decoder;
-    htp_string_t cursor = {
+    htstring_t cursor = {
         .startp = data,
-        .len = len
+        .len    = len
     };
 
     while (decoder->state != CHUNKED_COMPLETED)
@@ -1255,7 +1375,7 @@ parse_chunked(htparser * self, const char * data, size_t len)
                 if (decoder->chunk_size == -1L)
                 {
                     size_t nread = parse_chunk_head(self, decoder, cursor.startp, cursor.len);
-                    update_cursor_nread(&cursor, nread);
+                    htstring_consume(&cursor, nread);
                     if (decoder->chunk_size == -1L)
                         return len - cursor.len;
                     if (decoder->chunk_size == 0L)
@@ -1275,7 +1395,7 @@ parse_chunked(htparser * self, const char * data, size_t len)
                         return len - cursor.len;
                     }
                 }
-                size_t nread = self->content_len > cursor.len ? cursor.len : self->content_len;
+                size_t nread = self->content_len > cursor.len ? cursor.len : (size_t)self->content_len;
                 if (nread > 0 &&
                     hook_body_run(self, self->hooks, cursor.startp, nread))
                 {
@@ -1283,7 +1403,7 @@ parse_chunked(htparser * self, const char * data, size_t len)
                     return len - cursor.len;
                 }
                 self->content_len -= nread;
-                update_cursor_nread(&cursor, nread);
+                htstring_consume(&cursor, nread);
                 if (!self->content_len)
                 {
                     decoder->chunk_size = -1L;
@@ -1320,14 +1440,14 @@ parse_chunked(htparser * self, const char * data, size_t len)
                     if (!parse_header(self, startp, eol))
                     {
                         log_debug("failed");
-                        self->error = htparse_error_inval_hdr;
+                        /* preserve the specific error set by parse_header */
                         return len - cursor.len;
                     }
+                    ++decoder->header_count;
                 }
                 else
                 {
                     decoder->state = CHUNKED_COMPLETED;
-                    //process_footers();
                 }
                 break;
             }
@@ -1336,11 +1456,8 @@ parse_chunked(htparser * self, const char * data, size_t len)
         }
     }
 
-    if (decoder->state == CHUNKED_COMPLETED)
-    {
-        log_debug("completed");
-        self->state = PARSER_COMPLETED;
-    }
+    log_debug("completed");
+    self->state = PARSER_COMPLETED;
 
     return len - cursor.len;
 }
@@ -1350,7 +1467,7 @@ parse_length(htparser * self, const char * data, size_t len)
 {
     log_debug("(%p, %p, %zu)", self, data, len);
 
-    size_t chunk = len > self->content_len ? self->content_len : len;
+    size_t chunk = len > self->content_len ? (size_t)self->content_len : len;
     if (chunk > 0 &&
         hook_body_run(self, self->hooks, data, chunk))
     {
@@ -1364,7 +1481,7 @@ parse_length(htparser * self, const char * data, size_t len)
     }
     else
     {
-        log_debug("need %zu more bytes", self->content_len);
+        log_debug("need %llu more bytes", (unsigned long long)self->content_len);
     }
     return chunk;
 }
@@ -1385,25 +1502,9 @@ parse_identity(htparser * self, const char * data, size_t len)
 }
 
 static inline bool
-is_identity(htparser * self)
+is_identity_parser(htparser * self)
 {
-    log_debug("(%p)", self);
-    if (self->type != htp_type_response)
-    {
-        log_debug("not response");
-        return false;
-    }
-    if (htparser_should_keep_alive(self))
-    {
-        log_debug("keep-alive conn");
-        return false;
-    }
-    if (!(self->major == 1 && self->minor == 0))
-    {
-        log_debug("not 1.0");
-        return false;
-    }
-    return true;
+    return self->decoder.parse_data == parse_identity;
 }
 
 static inline void
@@ -1412,9 +1513,9 @@ content_length_strategy(htparser * self)
     log_debug("(%p)", self);
 
 #ifdef WITH_BULK_TEST
-//ONLY FOR BULK TESTING!!!!
-self->state = PARSER_COMPLETED;
-return;
+    /* ONLY FOR BULK TESTING!!!! */
+    self->state = PARSER_COMPLETED;
+    return;
 #endif
 
     if (self->flags & IS_CHUNKED)
@@ -1424,7 +1525,7 @@ return;
     }
     else if (self->content_len > 0)
         self->decoder.parse_data = parse_length;
-    else if (is_identity(self))
+    else if (is_identity_response(self))
         self->decoder.parse_data = parse_identity;
     else
         self->state = PARSER_COMPLETED;
@@ -1435,19 +1536,17 @@ parse_head(htparser * self, htparse_hooks * hooks, const char * data, size_t len
 {
     log_debug("(%p, %p, %p, %zu)", self, hooks, data, len);
 
-    htp_string_t cursor = {
+    htstring_t cursor = {
         .startp = data,
-        .len = len
+        .len    = len
     };
 
     while (self->state != PARSER_HEADERS_COMPLETED)
     {
         const char * startp = cursor.startp;
         const char * eol = memchr(startp, '\n', cursor.len);
-        size_t max_line_length = self->config->max_line_length;
 
-        if (max_line_length > 0 &&
-            ((!eol && cursor.len > max_line_length) || (eol && (eol - startp > max_line_length))))
+        if (line_too_long(&cursor, eol, self->config->max_line_length))
         {
             self->error = htparse_error_too_big;
             return len - cursor.len;
@@ -1480,11 +1579,19 @@ parse_head(htparser * self, htparse_hooks * hooks, const char * data, size_t len
             case PARSER_READ_HEADERS:
                 if ((eol - startp) > 0)
                 {
+                    size_t max_header_count = self->config->max_header_count;
+                    if (max_header_count > 0 && self->header_count >= max_header_count)
+                    {
+                        log_debug("Maximum header count exceeded");
+                        self->error = htparse_error_too_big;
+                        return len - cursor.len;
+                    }
                     if (!parse_header(self, startp, eol))
                     {
                         log_debug("invalid header");
                         return len - cursor.len;
                     }
+                    ++self->header_count;
                 }
                 else
                 {
@@ -1507,9 +1614,9 @@ htparser_run(htparser * self, htparse_hooks * hooks, const char * data, size_t l
     log_debug("(%p, %p, %p, %zu)", self, hooks, data, len);
 
     self->hooks = hooks;
-    htp_string_t cursor = {
+    htstring_t cursor = {
         .startp = data,
-        .len = len
+        .len    = len
     };
 
     while (1)
@@ -1521,8 +1628,12 @@ htparser_run(htparser * self, htparse_hooks * hooks, const char * data, size_t l
         {
             case PARSER_START:
                 self->state = PARSER_READ_HEAD_LINE;
-                hook_on_msg_begin_run(self, hooks);
-                continue; // Re-evaluate state immediately
+                if (hook_on_msg_begin_run(self, hooks))
+                {
+                    self->error = htparse_error_user;
+                    self->state = PARSER_ERROR;
+                }
+                continue;   /* re-evaluate state immediately */
 
             case PARSER_HEADERS_COMPLETED:
                 self->state = PARSER_READ_DATA;
@@ -1534,6 +1645,13 @@ htparser_run(htparser * self, htparse_hooks * hooks, const char * data, size_t l
                     self->error = htparse_error_user;
                     self->state = PARSER_ERROR;
                 }
+                else if (self->flags & SKIP_BODY)
+                {
+                    /* SKIP_BODY is set in the hdrs_complete callback;
+                     * see htparser_set_skip_body() for the alternative
+                     * pre-run contract */
+                    self->state = PARSER_COMPLETED;
+                }
                 continue;
 
             case PARSER_COMPLETED:
@@ -1542,7 +1660,8 @@ htparser_run(htparser * self, htparse_hooks * hooks, const char * data, size_t l
                     self->error = htparse_error_user;
                     self->state = PARSER_ERROR;
                 }
-                else {
+                else
+                {
                     self->state = PARSER_RESET;
                 }
                 continue;
@@ -1555,22 +1674,22 @@ htparser_run(htparser * self, htparse_hooks * hooks, const char * data, size_t l
                 return len - cursor.len;
 
             case PARSER_READ_DATA:
-                // Only enter if we have data
                 if (cursor.len == 0) goto exit_loop;
                 nread = self->decoder.parse_data(self, cursor.startp, cursor.len);
                 break;
 
-            default: // READ_HEAD_LINE, READ_HEADERS
-                // Only enter if we have data
+            default:    /* READ_HEAD_LINE, READ_HEADERS */
                 if (cursor.len == 0) goto exit_loop;
                 nread = parse_head(self, hooks, cursor.startp, cursor.len);
+                if (self->error != htparse_error_none)
+                    self->state = PARSER_ERROR;
                 break;
         }
 
-        update_cursor_nread(&cursor, nread);
+        htstring_consume(&cursor, nread);
 
-        // Progress check: if we didn't advance state AND didn't consume data,
-        // we are blocked
+        /* Progress check: if we didn't advance state AND didn't consume
+         * data, we are blocked */
         if (nread == 0 && self->state == prev_state)
             break;
     }
@@ -1583,9 +1702,18 @@ int
 htparser_should_keep_alive(htparser * self)
 {
     log_debug("(%p)", self);
-    return self &&
-            (self->flags & CONNECTION_KEEP_ALIVE) ||
-                ((self->major > 0 && self->minor > 0) && !(self->flags & CONNECTION_CLOSE));
+
+    if (!self)
+        return 0;
+
+    if (self->flags & CONNECTION_KEEP_ALIVE)
+        return 1;
+
+    if ((HTTP_VERSION_AS_INT(self) > HTTP_VERSION_10) &&
+        !(self->flags & CONNECTION_CLOSE))
+        return 1;
+
+    return 0;
 }
 
 void *
@@ -1627,7 +1755,7 @@ htparser_set_method(htparser * p, htp_method meth)
 const char *
 htparser_get_methodstr_m(htp_method meth)
 {
-    return meth < htp_method_UNKNOWN ? method_strmap[meth] : NULL;
+    return meth < htp_method_LAST ? method_strmap[meth] : NULL;
 }
 
 const char *
@@ -1657,35 +1785,20 @@ htparser_set_content_length(htparser * p, uint64_t len)
 int
 htparser_is_chunked(htparser * p)
 {
-    return p ? !!(p->flags & IS_CHUNKED) : 0;
+    return p ? !!((p->flags & IS_CHUNKED) == IS_CHUNKED) : 0;
 }
 
-/*
- * No Content-Length and no chunked Transfer-Encoding.
- * For responses this may be an identity (read-until-
- * connection-close) body.  Detect by checking:
- *   - parser type is response
- *   - status code implies a body (not 1xx/204/304)
- *   - connection is not keep-alive (implicit close)
- *     OR Connection: close was explicitly set
- *
- * Mirroring the logic in nodejs/http-parser.
- */
-static inline bool
-is_identity_response(htparser * p)
+/* See if there is a legitimate, valid, defined content-length. */
+int
+htparser_has_content_length(htparser * p)
 {
-    return (p->type == htp_type_response
-            && p->head_line.status_line.status_code != 0
-            && !(p->head_line.status_line.status_code >= 100 && p->head_line.status_line.status_code <= 199)
-            && p->head_line.status_line.status_code != 204
-            && p->head_line.status_line.status_code != 304
-            && !(p->flags & SKIP_BODY));
+    return p ? !(p->flags & IS_CHUNKED) && (p->flags & HAVE_CONTENT_LENGTH) : 0;
 }
 
 int
 htparser_is_identity_response(htparser * p)
 {
-    return p ? is_identity_response(p) : false;
+    return p ? !!is_identity_parser(p) : 0;
 }
 
 void
@@ -1715,7 +1828,7 @@ htparser_get_minor(htparser * p)
 unsigned char
 htparser_get_multipart(htparser * p)
 {
-    return p ? !!(p->flags & IS_MUTLIPART) : 0;
+    return p ? !!(p->flags & IS_MULTIPART) : 0;
 }
 
 htpparse_error
@@ -1771,7 +1884,7 @@ htparser_is_paused(htparser * p)
  * htparser_set_skip_body - tell the parser to skip body for this message.
  *
  * Must be called after htparser_run() returns for the on_hdrs_complete hook
- * (i.e. before body data arrives).  Typically used for HEAD responses or
+ * (i.e. before body data arrives). Typically used for HEAD responses or
  * CONNECT tunnels where the server sends headers but no body.
  */
 void
@@ -1783,9 +1896,9 @@ htparser_set_skip_body(htparser * p)
 htp_method
 htparser_parse_method(htparser * p, const char * m, const size_t sz)
 {
-    htp_string_t s = {
+    htstring_t s = {
         .startp = m,
-        .len = sz
+        .len    = sz
     };
     p->head_line.request_line.method = get_method(&s);
     return p->head_line.request_line.method;
@@ -1794,11 +1907,10 @@ htparser_parse_method(htparser * p, const char * m, const size_t sz)
 /**
  * htparser_run_eof - signal EOF (connection close) to the parser.
  *
- * For identity (read-until-close) responses the body length is unknown until
- * the underlying connection is closed by the peer.  The caller must invoke
- * this function after the last htparser_run() call (i.e. when it detects
- * EOF on the socket) so the parser can fire on_body / on_msg_complete for
- * any buffered identity-encoded data.
+ * For identity (read-until-close) responses the body length is unknown
+ * until the underlying connection is closed by the peer. The caller
+ * must invoke this function after the last htparser_run() call so the
+ * parser can fire on_msg_complete.
  *
  * Returns the number of bytes consumed (always 0 on entry, kept for
  * symmetry with htparser_run).
@@ -1806,11 +1918,11 @@ htparser_parse_method(htparser * p, const char * m, const size_t sz)
 size_t
 htparser_run_eof(htparser * p, htparse_hooks * hooks)
 {
-    int res = 0;
+    log_debug("(%p, %p)", p, hooks);
 
     p->error = htparse_error_none;
 
-    if (p->decoder.parse_data != parse_identity)
+    if (!is_identity_parser(p))
     {
         log_debug("not identity");
     }
@@ -2036,7 +2148,7 @@ test_request_parsing(htparser * parser)
     static const char msg[] =
         "POST /test-chunked-php/abc?abc=123 HTTP/1.1\r\n"
         "Content-type: text/plain\r\n"
-        "Transfer-encoding: chunked\r\n"
+        "Transfer-encoding: gzip, chunked\r\n"
         "\r\n"
         "7\r\n"
         "Welcome\r\n"
@@ -2052,7 +2164,7 @@ test_request_parsing(htparser * parser)
         "GET http://www.thehost.com:8080/images/test-image.gif?abc=123 HTTP/1.1\r\n"
         "Host: www.thehost.com\r\n"
         "\r\n"
-        "GET /images/test-image-2.gif HTTP/1.1\r\n"
+        " GET /images/test-image-2.gif HTTP/1.1\r\n"
         "Host: www.thehost.com\r\n"
         "Accept: image/gif\r\n"
         "\r\n"
@@ -2060,8 +2172,8 @@ test_request_parsing(htparser * parser)
 
     const char * curp = msg;
     size_t len = sizeof(msg) - 1;
-    size_t avail = 1; // Read msg[] one byte at a time to test all boundaries.
-//    size_t avail = len; // Read msg[] in one pass to test pipelining.
+//    size_t avail = 1; // Read msg[] one byte at a time to test all boundaries.
+    size_t avail = len; // Read msg[] in one pass to test pipelining.
     int64_t start_us = get_monotonic_time_usec();
 
     htparser_init(parser, htp_type_request);
@@ -2199,6 +2311,21 @@ test_response_parsing(htparser * parser)
     evhtp_assert(parser->error == htparse_error_none);
 }
 
+static void
+test_string_scratch(void)
+{
+    log_debug("()");
+
+    const char str[] = "This is a test";
+    htstring_t s = htstring_ctor(str, sizeof(str) - 1);
+
+    ht_scratch_auto(scratch);
+    const char* name_z = htstring_to_cstr(&scratch, s);
+
+    log_debug("alloc %u", scratch.ptr != scratch.stack);
+    log_debug("\"%s\"", name_z);
+}
+
 int main(int argc, char ** argv)
 {
     htparser * parser = htparser_new();
@@ -2206,6 +2333,7 @@ log_debug("parser %p, %zu bytes", parser, sizeof(*parser));
     test_request_parsing(parser);
 #ifndef WITH_BULK_TEST
     test_response_parsing(parser);
+    test_string_scratch();
 #endif
     htparser_free(parser);
     log_debug("done");
