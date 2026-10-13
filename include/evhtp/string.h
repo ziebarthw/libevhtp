@@ -126,18 +126,6 @@ htstring_unquote(htstring_t * self)
     if (htstring_unenclose(self, '"', '"')->len != slen)
         return self;
     return htstring_unenclose(self, '\'', '\'');
-#if 0
-    if (self->len >= 2) {
-        char first = self->startp[0];
-        char last  = self->startp[self->len - 1];
-
-        if ((first == '"' && last == '"') || (first == '\'' && last == '\'')) {
-            self->startp++;
-            self->len -= 2;
-        }
-    }
-    return self;
-#endif//0
 }
 
 static inline htstring_t *

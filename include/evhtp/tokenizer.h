@@ -96,8 +96,6 @@ httokenizer_next(httokenizer_t * t, const ht_delim_policy_t * policy, htstring_t
     out->startp = startp;
     out->len = token_len;
 
-//    htstring_rtrim(out);
-
     if (hit) {
         /* Advance remaining: skip the token AND the delimiter */
         size_t consumed = (size_t)(hit - startp) + 1;
