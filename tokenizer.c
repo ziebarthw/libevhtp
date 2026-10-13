@@ -153,7 +153,7 @@ cookie_handler(const ht_cookie_t * cookie, void * ctx)
             (int)cookie->attrs[i].name.len, cookie->attrs[i].name.startp,
             (int)cookie->attrs[i].value.len, cookie->attrs[i].value.startp);
 htstring_t expires = htstring_ctor("expires", 7);
-if (htstring_strcasecmp(&cookie->attrs[i].name, &expires) == 0) {
+if (htstring_equalsi(cookie->attrs[i].name, expires)) {
     log_debug("found expires with value \"%.*s\"", (int)cookie->attrs[i].value.len, cookie->attrs[i].value.startp);
 }
     }
@@ -165,16 +165,16 @@ cookie_pair_handler(const ht_cookie_pair_t * pair, void * ctx)
 {
     log_debug("(%p, %p)", pair, ctx);
     log_debug("Cookie: %.*s=\"%.*s\"", (int)pair->name.len, pair->name.startp, (int)pair->value.len, pair->value.startp);
-    return htstring_strcmp_(&pair->name, "_ga") == 0 ? -1 : 0;
+    return htstring_equals(pair->name, HTSTRING_LIT("_ga")) ? -1 : 0;
 }
 
 static int
 my_processor(ht_element_t * el, void * ctx)
 {
-    htstring_t * s = htstring_trim_ltgt(&el->name);
+    htstring_t * s = htstring_unltgt(&el->name);
     log_debug("Element: \"%.*s\"", (int)s->len, s->startp);
     for (size_t i = 0; i < el->param_count; i++) {
-        htstring_trim_quotes(&el->params[i].value);
+        htstring_unquote(&el->params[i].value);
         log_debug("  Param %zu) %.*s=%.*s",
             i,
             (int)el->params[i].name.len, el->params[i].name.startp,
@@ -186,16 +186,16 @@ my_processor(ht_element_t * el, void * ctx)
 static inline bool
 is_known_coding(const htstring_t * coding)
 {
-    return htstring_strcasecmp_(coding, "compress") == 0 ||
-            htstring_strcasecmp_(coding, "deflate") == 0 ||
-            htstring_strcasecmp_(coding, "gzip") == 0;
+    return htstring_equalsi(*coding, HTSTRING_LIT("compress")) ||
+            htstring_equalsi(*coding, HTSTRING_LIT("deflate")) ||
+            htstring_equalsi(*coding, HTSTRING_LIT("gzip"));
 }
 
 /* returns 0 = valid framing, non-zero = reject (400) */
 static int
 validate_transfer_encoding(htstring_t header_value, bool * unknown_coding)
 {
-    log_debug("(\"%.*s\", %p)", (int)STRLEN(&header_value), STRPTR(&header_value), unknown_coding);
+    log_debug("(\"%.*s\", %p)", (int)header_value.len, header_value.startp, unknown_coding);
 
     ht_element_iter_t it = ht_element_iter_ctor(header_value);
 
@@ -204,13 +204,13 @@ validate_transfer_encoding(htstring_t header_value, bool * unknown_coding)
 
     while (ht_element_iter_next(&it, &el)) {
         count++;
-        if (htstring_strcasecmp_(&el.name, "chunked") == 0) {
+        if (htstring_equalsi(el.name, HTSTRING_LIT("chunked"))) {
             chunked_count++;
             log_debug("chunked count %u", chunked_count);
         }
         else if (!is_known_coding(&el.name)) {
             *unknown_coding = true;         /* caller maps to 501 */
-            log_debug("unknown coding \"%.*s\"", (int)STRLEN(&el.name), STRPTR(&el.name));
+            log_debug("unknown coding \"%.*s\"", (int)el.name.len, el.name.startp);
         }
         last = el;
     }
@@ -218,7 +218,7 @@ validate_transfer_encoding(htstring_t header_value, bool * unknown_coding)
     if (count == 0)                     return -1;   /* empty list */
     if (chunked_count > 1)              return -2;   /* repeated chunked */
     if (chunked_count == 1 &&
-        htstring_strcasecmp_(&last.name, "chunked") != 0)
+        htstring_equalsi(last.name, HTSTRING_LIT("chunked")))
                                         return -3;   /* chunked not final — smuggling config */
     return 0;
 }
@@ -267,13 +267,34 @@ while (ht_cookie_iter_next(&iter, &pair)) {
     }
 }
 #endif//0
+
+{
+    ht_param_iter_t it = ht_param_iter_ctor(HTSTRING_LIT("a=b&c=d&e=f"));
+    htstring_t key;
+    htstring_t val;
+    while (ht_param_iter_next(&it, &key, &val)) {
+        log_debug("key \"%.*s\", val \"%.*s\"", (int)key.len, key.startp, (int)val.len, val.startp);
+    }
+}
+{
+    ht_forwarded_iter_t it = ht_forwarded_iter_ctor(HTSTRING_LIT("for=192.0.2.43, for=\"[2001:db8:cafe::17]\", for=192.0.2.60;proto=http;by=203.0.113.43"));
+    ht_forwarded_element_t el;
+    while (ht_forwarded_iter_next(&it, &el)) {
+        htstring_unbracket(&el.for_val);
+        log_debug("for %.*s", (int)el.for_val.len, el.for_val.startp);
+        if (el.by_val.len) log_debug("by \"%.*s\"", (int)el.by_val.len, el.by_val.startp);
+        if (el.host_val.len) log_debug("host \"%.*s\"", (int)el.host_val.len, el.host_val.startp);
+        if (el.proto_val.len) log_debug("proto \"%.*s\"", (int)el.proto_val.len, el.proto_val.startp);
+    }
+}
+
 ht_element_iter_t iter = ht_element_iter_ctor(val);
 ht_element_t el;
 while (ht_element_iter_next(&iter, &el)) {
-    log_debug("\"%.*s\"", (int)STRLEN(&el.name), STRPTR(&el.name));
+    log_debug("\"%.*s\"", (int)el.name.len, el.name.startp);
     for (size_t i = 0; i < el.param_count; ++i) {
-        htstring_t * val = htstring_trim_quotes(&el.params[i].value);
-        log_debug("%.*s=\"%.*s\"", (int)STRLEN(&el.params[i].name), STRPTR(&el.params[i].name), (int)STRLEN(val), STRPTR(val));
+        htstring_t * val = htstring_unquote(&el.params[i].value);
+        log_debug("%.*s=\"%.*s\"", (int)el.params[i].name.len, el.params[i].name.startp, (int)val->len, val->startp);
     }
 }
 bool unknown_coding = false;
@@ -281,7 +302,7 @@ int rval = validate_transfer_encoding(val, &unknown_coding);
 if (rval != 0) {
     log_debug("failed %d, unknown coding %u", rval, unknown_coding);
 }
-    log_debug("done");
+    log_debug("done.");
     return 0;
 }
 #endif//WITH_TOKENIZER_TEST

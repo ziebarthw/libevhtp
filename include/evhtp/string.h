@@ -105,8 +105,28 @@ htstring_trim(htstring_t * self)
 }
 
 static inline htstring_t *
+htstring_unenclose(htstring_t * self, char cfirst, char clast)
+{
+    if (self->len >= 2) {
+        char first = self->startp[0];
+        char last  = self->startp[self->len - 1];
+
+        if (first == cfirst && last == clast) {
+            self->startp++;
+            self->len -= 2;
+        }
+    }
+    return self;
+}
+
+static inline htstring_t *
 htstring_unquote(htstring_t * self)
 {
+    size_t slen = self->len;
+    if (htstring_unenclose(self, '"', '"')->len != slen)
+        return self;
+    return htstring_unenclose(self, '\'', '\'');
+#if 0
     if (self->len >= 2) {
         char first = self->startp[0];
         char last  = self->startp[self->len - 1];
@@ -117,21 +137,19 @@ htstring_unquote(htstring_t * self)
         }
     }
     return self;
+#endif//0
 }
 
 static inline htstring_t *
 htstring_unltgt(htstring_t * self)
 {
-    if (self->len >= 2) {
-        char first = self->startp[0];
-        char last  = self->startp[self->len - 1];
+    return htstring_unenclose(self, '<', '>');
+}
 
-        if (first == '<' && last == '>') {
-            self->startp++;
-            self->len -= 2;
-        }
-    }
-    return self;
+static inline htstring_t *
+htstring_unbracket(htstring_t * self)
+{
+    return htstring_unenclose(self, '[', ']');
 }
 
 static inline unsigned char

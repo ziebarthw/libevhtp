@@ -174,12 +174,13 @@ ht_param_iter_ctor(htstring_t item)
 static const ht_delim_policy_t p_comma = { .is_single = true, .single_delim = ',' };
 static const ht_delim_policy_t p_semi  = { .is_single = true, .single_delim = ';' };
 static const ht_delim_policy_t p_eq    = { .is_single = true, .single_delim = '=' };
+static const ht_delim_policy_t p_amp   = { .is_single = true, .single_delim = '&' };
 
 static inline bool
 ht_param_iter_next(ht_param_iter_t * it, htstring_t * key, htstring_t * val)
 {
     htstring_t part;
-    if (!httokenizer_next(&it->tok, &p_eq, &part))
+    if (!httokenizer_next(&it->tok, &p_amp, &part))
         return false;
 
     const char * eq = memchr(part.startp, '=', part.len);
@@ -334,4 +335,83 @@ ht_cookie_iter_next(ht_cookie_iter_t * it, ht_cookie_pair_t * out)
         out->value.len    = 0;
     }
     return true;
+}
+
+typedef struct {
+    httokenizer_t tok; /* iterates the comma-separated hops */
+} ht_forwarded_iter_t;
+
+static inline void
+ht_forwarded_iter_init(ht_forwarded_iter_t * it, htstring_t header)
+{
+    httokenizer_init(&it->tok, header);
+}
+
+static inline ht_forwarded_iter_t
+ht_forwarded_iter_ctor(htstring_t header_value)
+{
+    ht_forwarded_iter_t self;
+    ht_forwarded_iter_init(&self, header_value);
+    return self;
+}
+
+/* Represents a single forwarded element (one hop) */
+typedef struct {
+    htstring_t for_val;
+    htstring_t by_val;
+    htstring_t proto_val;
+    htstring_t host_val;
+} ht_forwarded_element_t;
+
+static inline bool
+ht_forwarded_iter_next(ht_forwarded_iter_t * it, ht_forwarded_element_t * el)
+{
+    htstring_t hop_str;
+
+    /* Loop over comma-separated hops */
+    while (httokenizer_next(&it->tok, &p_comma, &hop_str)) {
+        htstring_trim(&hop_str);
+        if (hop_str.len == 0)
+            continue;
+
+        memset(el, 0, sizeof(*el));
+
+        /* Inner tokenizer for semicolons — encapsulated completely inside next() */
+        httokenizer_t param_tok = httokenizer_ctor(hop_str);
+        htstring_t param;
+
+        while (httokenizer_next(&param_tok, &p_semi, &param)) {
+            htstring_trim(&param);
+            if (param.len == 0)
+                continue;
+
+            const char * eq = memchr(param.startp, '=', param.len);
+            if (!eq)
+                continue;
+
+            htstring_t name = { .startp = param.startp, .len = (size_t)(eq - param.startp) };
+            htstring_t val  = { .startp = eq + 1,        .len = param.len - name.len - 1 };
+
+            htstring_trim(&name);
+            htstring_trim(&val);
+            htstring_unquote(&val);
+
+            if (htstring_equalsi(name, HTSTRING_LIT("for"))) {
+                el->for_val = val;
+            } else if (htstring_equalsi(name, HTSTRING_LIT("by"))) {
+                el->by_val = val;
+            } else if (htstring_equalsi(name, HTSTRING_LIT("proto"))) {
+                el->proto_val = val;
+            } else if (htstring_equalsi(name, HTSTRING_LIT("host"))) {
+                el->host_val = val;
+            }
+        }
+
+        /* If this hop contained a 'for' parameter, yield it */
+        if (el->for_val.len > 0) {
+            return true;
+        }
+    }
+
+    return false;
 }
