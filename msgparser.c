@@ -2207,7 +2207,7 @@ test_request_parsing(htparser * parser)
 
 #else
 
-    FILE * fp = fopen("/home/parallels/projects/RProxy-htm8/tmp/requests_only.log", "rt");
+    FILE * fp = fopen("testdata/requests_only.log", "rt");
     char buf[parser->config->max_line_length * 2];
     size_t bufsize = sizeof(buf);
     char * bufp = buf;
