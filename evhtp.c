@@ -5781,25 +5781,22 @@ handle_h2_headers_frame(nghttp2_session * session, const nghttp2_frame * frame)
                 htp__unlock_(evhtp);
 
                 evhtp_res res = htp__hook_hostname_(req, host->val, host->vlen);
+
+                if (req->flags & EVHTP_REQ_FLAG_FINISHED) {
+                    /* A hook already replied (e.g. a filter's 429). In h2 the
+                    * response ends this stream only; the connection and its other
+                    * streams are unaffected. Do not dispatch req->cb: a second
+                    * nghttp2_submit_response() on the same stream is a programming
+                    * error in nghttp2 and can crash. */
+                    log_debug("stream %d answered early (res %d)", frame->hd.stream_id, res);
+                    return 0;
+                }
+
                 if (res != EVHTP_RES_OK) {
+                    /* Hook failed without replying: reset only this stream. */
                     log_debug("failed with res %d", res);
-
-                    nghttp2_session_set_stream_user_data(session,
-                        frame->hd.stream_id, NULL);
-
-                    if (req->flags & EVHTP_REQ_FLAG_FINISHED) {
-                        /* A reply was sent — close the connection via GOAWAY
-                        * so it is flushed in the same nghttp2_session_send() pass
-                        * as the response itself. Mirrors HTTP/1 Connection: close
-                        * behavior on error. */
-                        nghttp2_submit_goaway(
-                            session,
-                            NGHTTP2_FLAG_NONE,
-                            nghttp2_session_get_last_proc_stream_id(session),
-                            NGHTTP2_NO_ERROR,
-                            NULL, 0);
-                    }
-
+                    nghttp2_submit_rst_stream(session, NGHTTP2_FLAG_NONE,
+                                            frame->hd.stream_id, NGHTTP2_INTERNAL_ERROR);
                     return 0;
                 }
             }
@@ -5808,25 +5805,22 @@ handle_h2_headers_frame(nghttp2_session * session, const nghttp2_frame * frame)
         /* Headers complete — fire hooks and dispatch regardless
             * of whether a body follows */
         evhtp_res res = htp__hook_headers_(req, req->headers_in);
+
+        if (req->flags & EVHTP_REQ_FLAG_FINISHED) {
+            /* A hook already replied (e.g. a filter's 429). In h2 the
+             * response ends this stream only; the connection and its other
+             * streams are unaffected. Do not dispatch req->cb: a second
+             * nghttp2_submit_response() on the same stream is a programming
+             * error in nghttp2 and can crash. */
+            log_debug("stream %d answered early (res %d)", frame->hd.stream_id, res);
+            return 0;
+        }
+
         if (res != EVHTP_RES_OK) {
+            /* Hook failed without replying: reset only this stream. */
             log_debug("failed with res %d", res);
-
-            nghttp2_session_set_stream_user_data(session,
-                frame->hd.stream_id, NULL);
-
-            if (req->flags & EVHTP_REQ_FLAG_FINISHED) {
-                /* A reply was sent — close the connection via GOAWAY
-                * so it is flushed in the same nghttp2_session_send() pass
-                * as the response itself. Mirrors HTTP/1 Connection: close
-                * behavior on error. */
-                nghttp2_submit_goaway(
-                    session,
-                    NGHTTP2_FLAG_NONE,
-                    nghttp2_session_get_last_proc_stream_id(session),
-                    NGHTTP2_NO_ERROR,
-                    NULL, 0);
-            }
-
+            nghttp2_submit_rst_stream(session, NGHTTP2_FLAG_NONE,
+                                      frame->hd.stream_id, NGHTTP2_INTERNAL_ERROR);
             return 0;
         }
 
@@ -5860,6 +5854,11 @@ handle_h2_data_frame(nghttp2_session * session, const nghttp2_frame * frame)
 
         /* Set end_stream definitively from the protocol signal */
         HTP_FLAG_ON(req, EVHTP_REQ_FLAG_END_STREAM);
+
+        if (req->flags & EVHTP_REQ_FLAG_FINISHED) {
+            /* Already answered; keep the user data so on_stream_close frees it. */
+            return 0;
+        }
 
         /* Clear stream user data before dispatching — req->cb() may
          * free the request (e.g. upstream_response_cb calls
@@ -5969,6 +5968,11 @@ h2__on_data_chunk_recv_cb_(nghttp2_session * session,
         return -1;
     }
 
+    if (req->flags & EVHTP_REQ_FLAG_FINISHED) {
+        nghttp2_session_consume(session, stream_id, len);
+        return 0;
+    }
+
     if ((c = evhtp_request_get_connection(req)) == NULL) {
         log_debug("connection is null");
         return -1;
@@ -6054,6 +6058,37 @@ h2__server_on_stream_close_cb_(nghttp2_session * session,
     return 0;
 }
 
+/* Deferred flush: replies submitted outside nghttp2_session_mem_recv()
+ * (e.g. from an upstream response callback) have nothing else to push
+ * them out, so schedule one nghttp2_session_send() for the next loop
+ * turn. Running it later, rather than inside evhtp_h2_send_reply(), keeps
+ * on_stream_close (which frees the request) from firing while the caller
+ * is still using the request. Multiple replies coalesce into one flush. */
+static void
+h2__flush_cb_(evutil_socket_t fd, short what, void * arg)
+{
+    evhtp_h2_conn_ctx_t * ctx = arg;
+    int                   rv;
+
+    (void)fd;
+    (void)what;
+
+    log_debug("(%p)", ctx);
+
+    if ((rv = nghttp2_session_send(ctx->session)) != 0) {
+        log_error("nghttp2_session_send: %s", nghttp2_strerror(rv));
+        evhtp_safe_free(ctx->conn, evhtp_connection_free);
+    }
+}
+
+static void
+h2__schedule_flush_(evhtp_h2_conn_ctx_t * ctx)
+{
+    if (ctx->flush_ev != NULL) {
+        event_active(ctx->flush_ev, EV_WRITE, 1);
+    }
+}
+
 static nghttp2_ssize
 h2__send_cb_(nghttp2_session * session,
              const uint8_t * data, size_t length,
@@ -6084,6 +6119,14 @@ evhtp_h2_conn_ctx_new(evhtp_connection_t * conn, evhtp_type role)
     }
 
     ctx->conn = conn;
+    ctx->flush_ev = event_new(bufferevent_get_base(conn->bev), -1, 0,
+                              h2__flush_cb_, ctx);
+    if (ctx->flush_ev == NULL)
+    {
+        log_error("event_new failed");
+        htp__free_(ctx);
+        return NULL;
+    }
 
     /* --- nghttp2 options: permissive mode --- */
     nghttp2_option_new(&opt);
@@ -6166,6 +6209,7 @@ evhtp_h2_conn_ctx_free(evhtp_h2_conn_ctx_t * ctx)
         return;
     }
 
+    evhtp_safe_free(ctx->flush_ev, event_free);
     evhtp_safe_free(ctx->session, nghttp2_session_del);
     htp__free_(ctx);
 }
@@ -6253,7 +6297,11 @@ evhtp_h2_send_reply(evhtp_request_t * req, evhtp_res code)
     htp__free_(nva);
 
     HTP_FLAG_ON(req, EVHTP_REQ_FLAG_FINISHED);
-    nghttp2_session_send(ctx->session);
+
+    /* Inside nghttp2_session_mem_recv() the read callback flushes when
+     * it returns; elsewhere nothing would, so schedule a flush. Doing it
+     * in both cases is harmless (an extra send with nothing queued). */
+    h2__schedule_flush_(ctx);
 
     return 0;
 }
