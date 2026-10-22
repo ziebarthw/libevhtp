@@ -2968,7 +2968,7 @@ if (avail > len) avail = len;
     }
 
 #if 0
-    FILE * fp = fopen("/home/parallels/projects/RProxy-htm8/tmp/requests_only.log", "rt");
+    FILE * fp = fopen("testdata/requests_only.log", "rt");
     char buf[8192];
     char * bufp = buf;
     char * readp = buf;
