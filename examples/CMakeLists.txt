@@ -25,13 +25,10 @@ if(NOT EVHTP_DISABLE_EVTHR)
 
 	add_executable(test_proxy EXCLUDE_FROM_ALL test_proxy.c)
 	target_link_libraries(test_proxy evhtp ${LIBEVHTP_EXTERNAL_LIBS} ${SYS_LIBS})
-	add_executable(htm8 EXCLUDE_FROM_ALL htm8.c)
-	target_link_libraries(htm8 evhtp ${LIBEVHTP_EXTERNAL_LIBS} ${SYS_LIBS})
 	add_executable(obound_proxy EXCLUDE_FROM_ALL obound_proxy.c)
 	target_link_libraries(obound_proxy evhtp ${LIBEVHTP_EXTERNAL_LIBS} ${SYS_LIBS})
 
 	add_dependencies(examples test_proxy)
-	add_dependencies(examples htm8)
 	add_dependencies(examples obound_proxy)
 endif()
 
