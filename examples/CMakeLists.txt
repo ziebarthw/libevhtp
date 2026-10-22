@@ -64,9 +64,10 @@ if(NOT EVHTP_DISABLE_SSL)
 endif()
 
 add_dependencies(examples
-  example_request_fini
-  example_chunked example_pause
-  example_vhost test_extensive
+  example_pause
+  example_vhost
   test_basic
-  test_vhost test_client
-  test_query test_perf example_basic)
+  test_vhost
+  test_query
+  test_perf
+  example_basic)
