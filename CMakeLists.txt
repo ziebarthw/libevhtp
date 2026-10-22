@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.1)
+cmake_minimum_required(VERSION 3.12)
 
 list(APPEND CMAKE_MODULE_PATH ${CMAKE_CURRENT_SOURCE_DIR}/cmake)
 
@@ -104,19 +104,24 @@ if(NOT EVHTP_DISABLE_REGEX)
     endif()
 endif()
 
+# HTTP/2 needs nghttp2 >= 1.60 (nghttp2_ssize, nghttp2_data_provider2,
+# nghttp2_submit_request2). nghttp2 installs no CMake package config, so it is
+# located through pkg-config only; set PKG_CONFIG_PATH for a non-system copy.
 if(NOT EVHTP_DISABLE_H2)
-    find_package(Nghttp2 QUIET)
-    if(NOT Nghttp2_FOUND)
-        find_package(PkgConfig REQUIRED)
-        pkg_check_modules(NGHTTP2 REQUIRED libnghttp2)
+    find_package(PkgConfig)
+
+    if(PKG_CONFIG_FOUND)
+        pkg_check_modules(NGHTTP2 "libnghttp2>=1.60")
     endif()
 
-    if(NGHTTP2_FOUND OR Nghttp2_FOUND)
+    if(NGHTTP2_FOUND)
+        # Full paths (not bare names), so the copy pkg-config found is the
+        # one linked even when it is not on the default library path.
         list(APPEND LIBEVHTP_EXTERNAL_LIBS ${NGHTTP2_LINK_LIBRARIES})
         list(APPEND LIBEVHTP_EXTERNAL_INCLUDES ${NGHTTP2_INCLUDE_DIRS})
-        list(APPEND package_deps nghttp2)
+        message(STATUS "nghttp2 ${NGHTTP2_VERSION} found: HTTP/2 enabled")
     else()
-        message(STATUS "nghttp2 NOT FOUND, disabling H2 support")
+        message(WARNING "nghttp2 >= 1.60 not found (via pkg-config), disabling HTTP/2 support")
         set(EVHTP_DISABLE_H2 ON)
     endif()
 endif()
