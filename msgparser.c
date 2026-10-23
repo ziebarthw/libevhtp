@@ -1627,6 +1627,11 @@ htparser_run(htparser * self, htparse_hooks * hooks, const char * data, size_t l
         switch (self->state)
         {
             case PARSER_START:
+                /* Begin the next message only when its first byte arrives,
+                 * as htparser does: on_msg_begin recycles the connection's
+                 * request, and a request just answered must stay until its
+                 * response has been written (keep-alive or close). */
+                if (cursor.len == 0) goto exit_loop;
                 self->state = PARSER_READ_HEAD_LINE;
                 if (hook_on_msg_begin_run(self, hooks))
                 {
