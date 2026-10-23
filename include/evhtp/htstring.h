@@ -1,5 +1,6 @@
 
-#pragma once
+#ifndef HTSTRING_H
+#define HTSTRING_H
 
 #include <stdbool.h>
 #include <string.h>
@@ -241,3 +242,5 @@ htstring_to_cstr(ht_scratch_t * buf, const htstring_t s)
 
     return buf->ptr;
 }
+
+#endif
