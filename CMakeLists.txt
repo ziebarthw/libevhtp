@@ -52,9 +52,17 @@ set(LIBEVHTP_SOURCE_FILES
     evhtp.c
     numtoa.c
     msgparser.c
-    parsed_uri.c
-    tokenizer.c
     log.c)
+
+# htstring (https://github.com/ziebarthw/htstring): htstring_t, the URI parser
+# and the header tokenizer that msgparser.c is built on. Found through
+# pkg-config like nghttp2; set PKG_CONFIG_PATH or CMAKE_PREFIX_PATH for a
+# non-system copy.
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(HTSTRING REQUIRED htstring)
+list(APPEND LIBEVHTP_EXTERNAL_LIBS ${HTSTRING_LINK_LIBRARIES})
+list(APPEND LIBEVHTP_EXTERNAL_INCLUDES ${HTSTRING_INCLUDE_DIRS})
+message(STATUS "htstring ${HTSTRING_VERSION} found")
 
 find_package(LibEvent REQUIRED)
 list(APPEND LIBEVHTP_EXTERNAL_LIBS ${LIBEVENT_LIBRARIES})

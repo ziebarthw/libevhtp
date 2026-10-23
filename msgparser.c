@@ -13,9 +13,9 @@
 //#define WITH_BULK_TEST
 
 #include "evhtp/config.h"
-#include "evhtp/htstring.h"
-#include "evhtp/tokenizer.h"
-#include "evhtp/parsed_uri.h"
+#include "htstring/htstring.h"
+#include "htstring/tokenizer.h"
+#include "htstring/parsed_uri.h"
 #include "evhtp/parser.h"
 #ifdef WITH_BULK_TEST
 #undef EVHTP_DEBUG
