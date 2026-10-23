@@ -31,7 +31,7 @@ htstring_ctor(const char * startp, size_t len)
 }
 
 /*
- * Cursor primitives.  (Belong in evhtp/string.h; kept here so this
+ * Cursor primitives.  (Belong in evhtp/htstring.h; kept here so this
  * file is reviewable standalone.  Move verbatim.)
  *
  *   htstring_end()      - end pointer of a region.
