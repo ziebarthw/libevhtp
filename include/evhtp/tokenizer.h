@@ -7,7 +7,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
-#include "evhtp/string.h"
+#include "evhtp/htstring.h"
 
 typedef struct ht_delim_policy ht_delim_policy_t;
 struct ht_delim_policy {

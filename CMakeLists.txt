@@ -66,7 +66,7 @@ set(evhtp_dir_headers
   "include/evhtp/parser.h"
   "include/evhtp/msgparser.h"
   "include/evhtp/parsed_uri.h"
-  "include/evhtp/string.h"
+  "include/evhtp/htstring.h"
   "include/evhtp/tokenizer.h"
   "include/evhtp/log.h")
 

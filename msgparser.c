@@ -13,7 +13,7 @@
 //#define WITH_BULK_TEST
 
 #include "evhtp/config.h"
-#include "evhtp/string.h"
+#include "evhtp/htstring.h"
 #include "evhtp/tokenizer.h"
 #include "evhtp/parsed_uri.h"
 #include "evhtp/parser.h"

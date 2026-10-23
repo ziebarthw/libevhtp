@@ -3,7 +3,7 @@
 
 #include <stdbool.h>
 #include <stdint.h>
-#include "evhtp/string.h"
+#include "evhtp/htstring.h"
 
 typedef struct uri_field_data uri_field_data_t;
 struct uri_field_data {
