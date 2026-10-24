@@ -4433,6 +4433,13 @@ evhtp_send_reply_start(evhtp_request_t * request, evhtp_res code)
 
     c = evhtp_request_get_connection(request);
 
+#ifndef EVHTP_DISABLE_H2
+    if (c->flags & EVHTP_CONN_FLAG_IS_HTTP2) {
+        evhtp_h2_send_reply_start(request, code);
+        return;
+    }
+#endif
+
     if (!(reply_buf = htp__create_reply_(request, code))) {
         evhtp_safe_free(c, evhtp_connection_free);
         return;
@@ -4449,12 +4456,26 @@ evhtp_send_reply_body(evhtp_request_t * request, struct evbuffer * buf)
 
     c = request->conn;
 
+#ifndef EVHTP_DISABLE_H2
+    if (c->flags & EVHTP_CONN_FLAG_IS_HTTP2) {
+        evhtp_h2_send_reply_body(request, buf);
+        return;
+    }
+#endif
+
     bufferevent_write_buffer(c->bev, buf);
 }
 
 void
 evhtp_send_reply_end(evhtp_request_t * request)
 {
+#ifndef EVHTP_DISABLE_H2
+    if (request->conn->flags & EVHTP_CONN_FLAG_IS_HTTP2) {
+        evhtp_h2_send_reply_end(request);
+        return;
+    }
+#endif
+
     HTP_FLAG_ON(request, EVHTP_REQ_FLAG_FINISHED);
 }
 
@@ -4577,6 +4598,13 @@ evhtp_send_reply_chunk(evhtp_request_t * request, struct evbuffer * buf)
     if (evbuffer_get_length(buf) == 0) {
         return;
     }
+
+#ifndef EVHTP_DISABLE_H2
+    if (request->conn->flags & EVHTP_CONN_FLAG_IS_HTTP2) {
+        evhtp_h2_send_reply_body(request, buf);     /* DATA frames, no chunks */
+        return;
+    }
+#endif
 
     output = bufferevent_get_output(request->conn->bev);
 
@@ -6263,28 +6291,21 @@ skip_h2_response_header(const evhtp_kv_t * kv)
     }
 }
 
-int
-evhtp_h2_send_reply(evhtp_request_t * req, evhtp_res code)
+/* :status plus headers_out, without connection-specific headers. Returns
+ * the array (free with htp__free_) and its length in *nvlen; status_str
+ * must outlive the submit call. */
+static nghttp2_nv *
+h2__response_nv_(evhtp_request_t * req, evhtp_res code, char status_str[4], size_t * nvlen)
 {
-    log_debug("(%p, %d)", req, code);
+    evhtp_kv_t * kv;
+    nghttp2_nv * nva;
+    size_t       n = 1, i;
 
-    evhtp_connection_t  * c = evhtp_request_get_connection(req);
-    evhtp_h2_conn_ctx_t * ctx = c->h2ctx;
-    int32_t               stream_id;
-    char                  status_str[4];
-    evhtp_kv_t          * kv;
-    nghttp2_nv          * nva;
-    size_t                nvlen, i;
+    TAILQ_FOREACH(kv, req->headers_out, next) n++;     /* upper bound */
 
-    /* Find the stream_id for this request */
-    stream_id = req->stream_id;
-
-    /* Build nv array: :status first, then headers_out (an upper bound:
-     * connection-specific headers are skipped below) */
-    nvlen = 1;
-    TAILQ_FOREACH(kv, req->headers_out, next) nvlen++;
-
-    nva = htp__malloc_(nvlen * sizeof(nghttp2_nv));
+    if ((nva = htp__malloc_(n * sizeof(nghttp2_nv))) == NULL) {
+        return NULL;
+    }
 
     evhtp_modp_u32toa(code, status_str);
 
@@ -6309,19 +6330,35 @@ evhtp_h2_send_reply(evhtp_request_t * req, evhtp_res code)
         i++;
     }
 
-    nvlen = i;
+    *nvlen = i;
 
-    size_t body_len = evbuffer_get_length(req->buffer_out);
+    return nva;
+}
 
-    int submit_rv;
-    if (body_len > 0) {
+int
+evhtp_h2_send_reply(evhtp_request_t * req, evhtp_res code)
+{
+    log_debug("(%p, %d)", req, code);
+
+    evhtp_connection_t  * c = evhtp_request_get_connection(req);
+    evhtp_h2_conn_ctx_t * ctx = c->h2ctx;
+    char                  status_str[4];
+    nghttp2_nv          * nva;
+    size_t                nvlen;
+    int                   submit_rv;
+
+    if ((nva = h2__response_nv_(req, code, status_str, &nvlen)) == NULL) {
+        return -1;
+    }
+
+    if (evbuffer_get_length(req->buffer_out) > 0) {
         nghttp2_data_provider prd = {
             .source.ptr    = req,
             .read_callback = h2__data_read_cb_,
         };
-        submit_rv = nghttp2_submit_response(ctx->session, stream_id, nva, nvlen, &prd);
+        submit_rv = nghttp2_submit_response(ctx->session, req->stream_id, nva, nvlen, &prd);
     } else {
-        submit_rv = nghttp2_submit_response(ctx->session, stream_id, nva, nvlen, NULL);
+        submit_rv = nghttp2_submit_response(ctx->session, req->stream_id, nva, nvlen, NULL);
     }
 
     if (submit_rv != 0) {
@@ -6336,6 +6373,131 @@ evhtp_h2_send_reply(evhtp_request_t * req, evhtp_res code)
      * it returns; elsewhere nothing would, so schedule a flush. Doing it
      * in both cases is harmless (an extra send with nothing queued). */
     h2__schedule_flush_(ctx);
+
+    return 0;
+}
+
+/*
+ * Streaming replies (evhtp_send_reply_start/_body/_end, and the chunk_*
+ * functions, which use them): the response HEADERS go out at once, the
+ * body follows in DATA frames as the application supplies it.
+ *
+ * The body waits in req->buffer_out until nghttp2 takes it: as fast as the
+ * peer's flow-control window allows. While it is empty and the reply has
+ * not ended, the data source answers NGHTTP2_ERR_DEFERRED, which parks the
+ * stream; more body (or the end) resumes it. An application that wants
+ * backpressure watches req->buffer_out: on HTTP/2 that is where unsent body
+ * accumulates (on HTTP/1.x it is the connection's output buffer).
+ *
+ * As for every HTTP/2 request, req is freed when its stream closes: after
+ * the last DATA frame, or when the peer resets the stream. The request_fini
+ * hook says so; the application must not use req after it.
+ */
+static nghttp2_ssize
+h2__stream_read_cb_(nghttp2_session * session,
+                    int32_t stream_id,
+                    uint8_t * buf, size_t length,
+                    uint32_t * data_flags,
+                    nghttp2_data_source * source,
+                    void * user_data)
+{
+    evhtp_request_t * req   = source->ptr;
+    size_t            avail = evbuffer_get_length(req->buffer_out);
+    size_t            n     = avail < length ? avail : length;
+
+    (void)session;
+    (void)stream_id;
+    (void)user_data;
+
+    if (n == 0 && !(req->flags & EVHTP_REQ_FLAG_FINISHED)) {
+        log_debug("stream %d: waiting for body", stream_id);
+        return NGHTTP2_ERR_DEFERRED;
+    }
+
+    if (n > 0) {
+        evbuffer_remove(req->buffer_out, buf, n);
+    }
+
+    if ((req->flags & EVHTP_REQ_FLAG_FINISHED) && evbuffer_get_length(req->buffer_out) == 0) {
+        *data_flags |= NGHTTP2_DATA_FLAG_EOF;
+    }
+
+    return (nghttp2_ssize)n;
+}
+
+/* More body, or the end, for a parked stream: let nghttp2 read again. */
+static void
+h2__stream_resume_(evhtp_request_t * req)
+{
+    evhtp_h2_conn_ctx_t * ctx = req->conn->h2ctx;
+
+    /* Fails harmlessly when the stream is not parked (it is still sending
+     * what it has, and will read again by itself). */
+    nghttp2_session_resume_data(ctx->session, req->stream_id);
+    h2__schedule_flush_(ctx);
+}
+
+int
+evhtp_h2_send_reply_start(evhtp_request_t * req, evhtp_res code)
+{
+    log_debug("(%p, %d)", req, code);
+
+    evhtp_h2_conn_ctx_t * ctx = req->conn->h2ctx;
+    char                  status_str[4];
+    nghttp2_nv          * nva;
+    size_t                nvlen;
+    int                   submit_rv;
+    nghttp2_data_provider prd = {
+        .source.ptr    = req,
+        .read_callback = h2__stream_read_cb_,
+    };
+
+    if ((nva = h2__response_nv_(req, code, status_str, &nvlen)) == NULL) {
+        return -1;
+    }
+
+    /* Any body already in buffer_out goes first, as on HTTP/1.x. */
+    submit_rv = nghttp2_submit_response(ctx->session, req->stream_id, nva, nvlen, &prd);
+    htp__free_(nva);
+
+    if (submit_rv != 0) {
+        log_error("nghttp2_submit_response failed: %s", nghttp2_strerror(submit_rv));
+        return -1;
+    }
+
+    HTP_FLAG_ON(req, EVHTP_REQ_FLAG_H2_STREAMING);
+    h2__schedule_flush_(ctx);
+
+    return 0;
+}
+
+int
+evhtp_h2_send_reply_body(evhtp_request_t * req, struct evbuffer * buf)
+{
+    log_debug("(%p, %p)", req, buf);
+
+    if (!(req->flags & EVHTP_REQ_FLAG_H2_STREAMING) || (req->flags & EVHTP_REQ_FLAG_FINISHED)) {
+        log_error("h2: body without a started, unfinished reply (stream %d)", req->stream_id);
+        return -1;
+    }
+
+    /* Takes the data, as the HTTP/1.x path does (buf is left empty). */
+    evbuffer_add_buffer(req->buffer_out, buf);
+    h2__stream_resume_(req);
+
+    return 0;
+}
+
+int
+evhtp_h2_send_reply_end(evhtp_request_t * req)
+{
+    log_debug("(%p)", req);
+
+    HTP_FLAG_ON(req, EVHTP_REQ_FLAG_FINISHED);
+
+    if (req->flags & EVHTP_REQ_FLAG_H2_STREAMING) {
+        h2__stream_resume_(req);    /* sends the rest, then END_STREAM */
+    }
 
     return 0;
 }

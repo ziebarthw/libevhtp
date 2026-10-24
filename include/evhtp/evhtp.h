@@ -434,6 +434,7 @@ struct evhtp_request {
     #define EVHTP_REQ_FLAG_HDRS_START       (1 << 4)
     #define EVHTP_REQ_FLAG_END_STREAM       (1 << 5)
     #define EVHTP_REQ_FLAG_VHOST_RESOLVED   (1 << 6)
+    #define EVHTP_REQ_FLAG_H2_STREAMING     (1 << 7)  /**< HTTP/2: reply started with evhtp_send_reply_start() */
     uint16_t flags;
 
     int32_t           stream_id;        /**< 0 for HTTP/1, nghttp2 stream ID for HTTP/2 */
