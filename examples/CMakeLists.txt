@@ -61,6 +61,13 @@ if(NOT EVHTP_DISABLE_SSL)
     target_link_libraries(example_https_client evhtp ${LIBEVHTP_EXTERNAL_LIBS} ${SYS_LIBS})
 
     add_dependencies(examples example_https_server example_https_client)
+
+    if(NOT EVHTP_DISABLE_H2)
+        # HTTP/2 responses leave out connection-specific headers (needs curl)
+        add_executable(test_h2_headers EXCLUDE_FROM_ALL test_h2_headers.c)
+        target_link_libraries(test_h2_headers evhtp ${LIBEVHTP_EXTERNAL_LIBS} ${SYS_LIBS})
+        add_dependencies(examples test_h2_headers)
+    endif()
 endif()
 
 add_dependencies(examples

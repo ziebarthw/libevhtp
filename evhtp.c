@@ -6237,6 +6237,32 @@ h2__data_read_cb_(nghttp2_session * session,
     return (nghttp2_ssize)to_copy;
 }
 
+/*
+ * Connection-specific header fields have no meaning in HTTP/2, and a message
+ * carrying one is malformed (RFC 9113 8.2.2): clients reject the response
+ * (curl: "Invalid HTTP header field", Chrome: ERR_HTTP2_PROTOCOL_ERROR).
+ * Applications written for HTTP/1.x set them routinely ("Connection: close"),
+ * so they are left out of HTTP/2 responses rather than sent. Header names
+ * need no case conversion here: nghttp2 lower-cases the names it copies.
+ */
+static inline bool
+skip_h2_response_header(const evhtp_kv_t * kv)
+{
+    switch (kv->klen) {
+        case 7:
+            return strncasecmp(kv->key, "upgrade", 7) == 0;
+        case 10:
+            return strncasecmp(kv->key, "connection", 10) == 0 ||
+                   strncasecmp(kv->key, "keep-alive", 10) == 0;
+        case 16:
+            return strncasecmp(kv->key, "proxy-connection", 16) == 0;
+        case 17:
+            return strncasecmp(kv->key, "transfer-encoding", 17) == 0;
+        default:
+            return false;
+    }
+}
+
 int
 evhtp_h2_send_reply(evhtp_request_t * req, evhtp_res code)
 {
@@ -6253,7 +6279,8 @@ evhtp_h2_send_reply(evhtp_request_t * req, evhtp_res code)
     /* Find the stream_id for this request */
     stream_id = req->stream_id;
 
-    /* Build nv array: :status first, then headers_out */
+    /* Build nv array: :status first, then headers_out (an upper bound:
+     * connection-specific headers are skipped below) */
     nvlen = 1;
     TAILQ_FOREACH(kv, req->headers_out, next) nvlen++;
 
@@ -6269,6 +6296,11 @@ evhtp_h2_send_reply(evhtp_request_t * req, evhtp_res code)
 
     i = 1;
     TAILQ_FOREACH(kv, req->headers_out, next) {
+        if (skip_h2_response_header(kv)) {
+            log_debug("h2: not sending connection-specific header %s", kv->key);
+            continue;
+        }
+
         nva[i].name     = (uint8_t *)kv->key;
         nva[i].namelen  = kv->klen;
         nva[i].value    = (uint8_t *)kv->val;
@@ -6276,6 +6308,8 @@ evhtp_h2_send_reply(evhtp_request_t * req, evhtp_res code)
         nva[i].flags    = NGHTTP2_NV_FLAG_NONE;
         i++;
     }
+
+    nvlen = i;
 
     size_t body_len = evbuffer_get_length(req->buffer_out);
 
