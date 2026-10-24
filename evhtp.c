@@ -301,7 +301,7 @@ htp__strndup_(const char * str, size_t len)
         char * p;
 
         if ((p = malloc_(len + 1)) != NULL) {
-            memcpy(p, str, len + 1);
+            memcpy(p, str, len);    /* str need not be terminated at len */
         } else {
             return NULL;
         }
@@ -1136,7 +1136,9 @@ htp__path_new_(evhtp_path_t ** out, const char * data, size_t len)
                 }
 
                 if (len > 1) {
-                    file = htp__strndup_((const char *)(data + 1), len);
+                    /* the rest after the leading "/" (len - 1 bytes; len
+                     * here took one byte past the target: "q?" for "/q?x") */
+                    file = htp__strndup_((const char *)(data + 1), len - 1);
 
                     if (evhtp_unlikely(file == NULL)) {
                         goto error;
@@ -1548,37 +1550,24 @@ htp__request_parse_start_(htparser * p)
     return 0;
 }
 
-/**
- * @brief parses http request arguments
- *
- * @see htparser_get_userdata
- *
- * @param p
- * @param data
- * @param len
- * @return 0 on success, -1 on failure (sets connection cr_status as well)
+/*
+ * The query string of a request target, without the '?': splits off a
+ * fragment ("#...") into uri->fragment unless the parser flags say to keep
+ * it, parses the rest into uri->query and keeps it verbatim in
+ * uri->query_raw. Shared by HTTP/1.x (the parser's args callback) and
+ * HTTP/2 (the :path pseudo-header). Returns -1 if the query cannot be
+ * parsed.
  */
 static int
-htp__request_parse_args_(htparser * p, const char * data, size_t len)
+htp__uri_set_query_(evhtp_uri_t * uri, const char * data, size_t len, int parser_flags)
 {
-    evhtp_connection_t * c   = htparser_get_userdata(p);
-    evhtp_uri_t        * uri = c->request->uri;
-    const char         * fragment;
-    int                  ignore_fragment;
-
-    if (c->type == evhtp_type_client) {
-        /* as a client, technically we should never get here, but just in case
-         * we return a 0 to the parser to continue.
-         */
-        return 0;
-    }
+    const char * fragment;
+    int          ignore_fragment;
 
     /* if the parser flags has the IGNORE_FRAGMENTS bit set, skip
      * the fragment parsing
      */
-    ignore_fragment = (c->htp->parser_flags &
-                       EVHTP_PARSE_QUERY_FLAG_IGNORE_FRAGMENTS);
-
+    ignore_fragment = (parser_flags & EVHTP_PARSE_QUERY_FLAG_IGNORE_FRAGMENTS);
 
     if (!ignore_fragment && (fragment = memchr(data, '#', len))) {
         /* Separate fragment from query according to RFC 3986.
@@ -1609,11 +1598,9 @@ htp__request_parse_args_(htparser * p, const char * data, size_t len)
         }
     }
 
-    uri->query = evhtp_parse_query_wflags(data, len, c->htp->parser_flags);
+    uri->query = evhtp_parse_query_wflags(data, len, parser_flags);
 
     if (evhtp_unlikely(!uri->query)) {
-        c->cr_status = EVHTP_RES_ERROR;
-
         return -1;
     }
 
@@ -1622,6 +1609,38 @@ htp__request_parse_args_(htparser * p, const char * data, size_t len)
 
     memcpy(uri->query_raw, data, len);
     uri->query_raw[len] = '\0';
+
+    return 0;
+}
+
+/**
+ * @brief parses http request arguments
+ *
+ * @see htparser_get_userdata
+ *
+ * @param p
+ * @param data
+ * @param len
+ * @return 0 on success, -1 on failure (sets connection cr_status as well)
+ */
+static int
+htp__request_parse_args_(htparser * p, const char * data, size_t len)
+{
+    evhtp_connection_t * c   = htparser_get_userdata(p);
+    evhtp_uri_t        * uri = c->request->uri;
+
+    if (c->type == evhtp_type_client) {
+        /* as a client, technically we should never get here, but just in case
+         * we return a 0 to the parser to continue.
+         */
+        return 0;
+    }
+
+    if (htp__uri_set_query_(uri, data, len, c->htp->parser_flags) == -1) {
+        c->cr_status = EVHTP_RES_ERROR;
+
+        return -1;
+    }
 
     return 0;
 } /* htp__request_parse_args_ */
@@ -2220,6 +2239,32 @@ htp__should_parse_query_body_(evhtp_request_t * req)
     return 1;
 }
 
+/* The request body (application/x-www-form-urlencoded) as its query. */
+static int
+htp__request_query_from_body_(evhtp_request_t * req)
+{
+    const char      * body;
+    size_t            body_len;
+    evhtp_uri_t     * uri    = req->uri;
+    struct evbuffer * buf_in = req->buffer_in;
+
+    body_len       = evbuffer_get_length(buf_in);
+    body           = (const char *)evbuffer_pullup(buf_in, body_len);
+
+    uri->query_raw = htp__calloc_(body_len + 1, 1);
+
+    if (evhtp_unlikely(uri->query_raw == NULL)) {
+        return -1;
+    }
+
+    memcpy(uri->query_raw, body, body_len);
+
+    uri->query = evhtp_parse_query(body, body_len);
+    uri->has_query_body = 1;
+
+    return 0;
+}
+
 static int
 htp__request_parse_fini_(htparser * p)
 {
@@ -2239,28 +2284,10 @@ htp__request_parse_fini_(htparser * p)
      * htp__should_parse_query_body_ does all the proper null checks.
      */
     if (htp__should_parse_query_body_(c->request) == 1) {
-        const char      * body;
-        size_t            body_len;
-        evhtp_uri_t     * uri;
-        struct evbuffer * buf_in;
-
-        uri            = c->request->uri;
-        buf_in         = c->request->buffer_in;
-
-        body_len       = evbuffer_get_length(buf_in);
-        body           = (const char *)evbuffer_pullup(buf_in, body_len);
-
-        uri->query_raw = htp__calloc_(body_len + 1, 1);
-
-        if (evhtp_unlikely(uri->query_raw == NULL)) {
+        if (htp__request_query_from_body_(c->request) == -1) {
             c->cr_status = EVHTP_RES_FATAL;
             return -1;
         }
-
-        memcpy(uri->query_raw, body, body_len);
-
-        uri->query = evhtp_parse_query(body, body_len);
-        uri->has_query_body = 1;
     }
 
     /*
@@ -5693,8 +5720,24 @@ h2__server_on_header_cb_(nghttp2_session * session,
                 return NGHTTP2_ERR_CALLBACK_FAILURE;
             }
 
+            /* :path is the whole request target. Split it as the HTTP/1.x
+             * parser does: the path up to '?' (or '#'), then the query
+             * string after '?' (with any fragment), which fills
+             * uri->query, uri->query_raw and uri->fragment. */
+            const char  * target = (const char *)value;
+            const char  * qmark  = memchr(target, '?', valuelen);
+            const char  * hash   = memchr(target, '#', valuelen);
+            size_t        plen   = valuelen;
             evhtp_path_t* path;
-            if (htp__path_new_(&path, (const char*)value, valuelen) == -1) {
+
+            if (qmark && (!hash || qmark < hash)) {
+                plen = (size_t)(qmark - target);
+            } else if (hash) {
+                plen  = (size_t)(hash - target);
+                qmark = NULL;   /* "?" inside the fragment is not a query */
+            }
+
+            if (htp__path_new_(&path, target, plen) == -1) {
                 log_debug("failed");
                 return NGHTTP2_ERR_CALLBACK_FAILURE;
             }
@@ -5706,6 +5749,13 @@ h2__server_on_header_cb_(nghttp2_session * session,
             htp__unlock_(conn->htp);
 
             htp__hook_path_(req, path);
+
+            if (qmark &&
+                htp__uri_set_query_(req->uri, qmark + 1, valuelen - plen - 1,
+                                    conn->htp->parser_flags) == -1) {
+                log_debug("bad query string");
+                return NGHTTP2_ERR_CALLBACK_FAILURE;
+            }
         } else if (namelen == 7 && memcmp(name, ":scheme", 7) == 0) {
             if (htp__require_uri__(req) == -1) {
                 log_error("failed");
@@ -5865,6 +5915,25 @@ handle_h2_headers_frame(nghttp2_session * session, const nghttp2_frame * frame)
     return 0;
 }
 
+/* htp__should_parse_query_body_() for HTTP/2: the content length there
+ * comes from the connection's HTTP/1.x parser, which HTTP/2 streams share
+ * and do not set; on HTTP/2 the body is complete when the stream ends. */
+static int
+htp__h2_should_parse_query_body_(evhtp_request_t * req)
+{
+    const char * content_type;
+
+    if (req->uri == NULL || req->uri->query != NULL ||
+        evbuffer_get_length(req->buffer_in) == 0) {
+        return 0;
+    }
+
+    content_type = evhtp_kv_find_n(req->headers_in, "content-type", 12);
+
+    return content_type != NULL &&
+           strncasecmp(content_type, "application/x-www-form-urlencoded", 33) == 0;
+}
+
 static inline int
 handle_h2_data_frame(nghttp2_session * session, const nghttp2_frame * frame)
 {
@@ -5895,6 +5964,13 @@ handle_h2_data_frame(nghttp2_session * session, const nghttp2_frame * frame)
          * nghttp2_session_mem_recv2() returns. Without this,
          * on_stream_close_cb_ reads freed memory. */
         nghttp2_session_set_stream_user_data(session, frame->hd.stream_id, NULL);
+
+        /* As HTTP/1.x does: no query string, and a form body, makes the
+         * body the query (the whole body is here: the stream has ended). */
+        if (htp__h2_should_parse_query_body_(req) &&
+            htp__request_query_from_body_(req) == -1) {
+            log_error("query from body: out of memory");
+        }
 
         /* Body complete — full request now received, dispatch */
         if (req->cb) {

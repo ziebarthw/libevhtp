@@ -72,6 +72,11 @@ if(NOT EVHTP_DISABLE_SSL)
         add_executable(test_h2_streaming EXCLUDE_FROM_ALL test_h2_streaming.c)
         target_link_libraries(test_h2_streaming evhtp ${LIBEVHTP_EXTERNAL_LIBS} ${SYS_LIBS})
         add_dependencies(examples test_h2_streaming)
+
+        # request target parsing (path, query) over HTTP/2 and HTTP/1.1
+        add_executable(test_h2_query EXCLUDE_FROM_ALL test_h2_query.c)
+        target_link_libraries(test_h2_query evhtp ${LIBEVHTP_EXTERNAL_LIBS} ${SYS_LIBS})
+        add_dependencies(examples test_h2_query)
     endif()
 endif()
 
