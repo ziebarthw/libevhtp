@@ -77,6 +77,11 @@ if(NOT EVHTP_DISABLE_SSL)
         add_executable(test_h2_query EXCLUDE_FROM_ALL test_h2_query.c)
         target_link_libraries(test_h2_query evhtp ${LIBEVHTP_EXTERNAL_LIBS} ${SYS_LIBS})
         add_dependencies(examples test_h2_query)
+
+        # receiving requests over HTTP/2: hook-set callbacks, flow control
+        add_executable(test_h2_request EXCLUDE_FROM_ALL test_h2_request.c)
+        target_link_libraries(test_h2_request evhtp ${LIBEVHTP_EXTERNAL_LIBS} ${SYS_LIBS})
+        add_dependencies(examples test_h2_request)
     endif()
 endif()
 
