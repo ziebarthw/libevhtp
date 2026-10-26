@@ -5880,6 +5880,11 @@ handle_h2_headers_frame(nghttp2_session * session, const nghttp2_frame * frame)
             }
         }
 
+        /* The request's callback, as on HTTP/1.x, before the headers hook
+         * (HTTP/1.x sets it when the path and host are parsed): the hook
+         * may replace req->cb / req->cbarg, which must then stand. */
+        htp__request_set_callbacks_(req);
+
         /* Headers complete — fire hooks and dispatch regardless
             * of whether a body follows */
         evhtp_res res = htp__hook_headers_(req, req->headers_in);
@@ -5901,8 +5906,6 @@ handle_h2_headers_frame(nghttp2_session * session, const nghttp2_frame * frame)
                                       frame->hd.stream_id, NGHTTP2_INTERNAL_ERROR);
             return 0;
         }
-
-        htp__request_set_callbacks_(req);
 
         /* Only dispatch if no body is coming */
         if (req->flags & EVHTP_REQ_FLAG_END_STREAM) {
@@ -6107,7 +6110,12 @@ h2__on_data_chunk_recv_cb_(nghttp2_session * session,
     }
     else if (evbuffer_get_length(buf)) {
         evbuffer_add_buffer(req->buffer_in, buf);
-        /* Tell nghttp2 we've consumed this data so flow control windows open */
+    }
+
+    /* The data is taken - kept in buffer_in, or handled (and drained) by the
+     * on_read hook: give the window back (automatic window updates are off),
+     * or a body over the stream or connection window (64 KB) stalls. */
+    if (res == 0) {
         nghttp2_session_consume(session, stream_id, len);
     }
 
