@@ -24,5 +24,6 @@ int  evhtp_h2_send_reply(evhtp_request_t * req, evhtp_res code);
 int  evhtp_h2_send_reply_start(evhtp_request_t * req, evhtp_res code);
 int  evhtp_h2_send_reply_body(evhtp_request_t * req, struct evbuffer * buf);
 int  evhtp_h2_send_reply_end(evhtp_request_t * req);
+int  evhtp_h2_reset_stream(evhtp_request_t * req, uint32_t error_code);
 
 #endif

@@ -4506,6 +4506,24 @@ evhtp_send_reply_end(evhtp_request_t * request)
     HTP_FLAG_ON(request, EVHTP_REQ_FLAG_FINISHED);
 }
 
+int
+evhtp_request_reset_stream(evhtp_request_t * request, uint32_t error_code)
+{
+    if (request == NULL || request->conn == NULL) {
+        return -1;
+    }
+
+#ifndef EVHTP_DISABLE_H2
+    if (request->conn->flags & EVHTP_CONN_FLAG_IS_HTTP2) {
+        return evhtp_h2_reset_stream(request, error_code);
+    }
+#else
+    (void)error_code;
+#endif
+
+    return -1;
+}
+
 void
 evhtp_send_reply(evhtp_request_t * request, evhtp_res code)
 {
@@ -6582,6 +6600,39 @@ evhtp_h2_send_reply_end(evhtp_request_t * req)
     if (req->flags & EVHTP_REQ_FLAG_H2_STREAMING) {
         h2__stream_resume_(req);    /* sends the rest, then END_STREAM */
     }
+
+    return 0;
+}
+
+int
+evhtp_h2_reset_stream(evhtp_request_t * req, uint32_t error_code)
+{
+    log_debug("(%p, %u)", req, error_code);
+
+    evhtp_h2_conn_ctx_t * ctx = req->conn->h2ctx;
+    int                   rv;
+
+    /* The stream must still be ours: once closed (or reset already) its
+     * user data is gone and the request is, or is about to be, freed. */
+    if (ctx == NULL || req->stream_id <= 0 ||
+        nghttp2_session_get_stream_user_data(ctx->session, req->stream_id) != req) {
+        return -1;
+    }
+
+    /* No more DATA for it; nghttp2 drops what it has queued for the stream
+     * and closes it once the RST_STREAM is sent: on_stream_close then frees
+     * the request. Received DATA for the closed stream still counts towards
+     * the connection window (nghttp2 consumes it). */
+    HTP_FLAG_ON(req, EVHTP_REQ_FLAG_FINISHED);
+    HTP_FLAG_OFF(req, EVHTP_REQ_FLAG_H2_STREAMING);
+
+    if ((rv = nghttp2_submit_rst_stream(ctx->session, NGHTTP2_FLAG_NONE, req->stream_id,
+                                        error_code)) != 0) {
+        log_error("nghttp2_submit_rst_stream: %s", nghttp2_strerror(rv));
+        return -1;
+    }
+
+    h2__schedule_flush_(ctx);
 
     return 0;
 }

@@ -914,6 +914,28 @@ EVHTP_EXPORT void evhtp_send_reply_body(evhtp_request_t * request, struct evbuff
 EVHTP_EXPORT void evhtp_send_reply_end(evhtp_request_t * request);
 
 /**
+ * @brief Abandon one request's exchange without closing its connection: on
+ *        HTTP/2 the stream is reset (RST_STREAM with error_code, e.g. 0x2
+ *        INTERNAL_ERROR or 0x8 CANCEL) and the connection's other streams
+ *        go on. Whatever was queued for the stream is dropped. The request
+ *        is freed (its on_request_fini hook runs) on a later turn of the
+ *        event loop, once the reset is sent: do not use it after this call
+ *        returns 0.
+ *
+ *        HTTP/1.x has no such thing - an exchange can only be abandoned by
+ *        closing the connection - so it returns -1 there and does nothing;
+ *        the caller frees the connection instead. Also -1 if the stream is
+ *        already closed or the reset cannot be queued.
+ *
+ * @param request
+ * @param error_code an HTTP/2 error code (RFC 9113, section 7)
+ *
+ * @return 0 if the reset was queued, -1 otherwise
+ */
+EVHTP_EXPORT int evhtp_request_reset_stream(evhtp_request_t * request, uint32_t error_code);
+#define EVHTP_HAVE_REQUEST_RESET_STREAM 1
+
+/**
  * @brief Determine if a response should have a body.
  * Follows the rules in RFC 2616 section 4.3.
  * @return 1 if the response MUST have a body; 0 if the response MUST NOT have
