@@ -212,47 +212,58 @@ take_line(htparser * p, const char * data, size_t len, htstring_t * line, size_t
 /* Small helpers                                                            */
 /* ------------------------------------------------------------------------ */
 
+/* Method names by length, most common first within a length. */
+static const struct {
+    const char * name;
+    size_t       len;
+    htp_method   method;
+} methods[] = {
+    { "GET",       3, htp_method_GET },     { "PUT",       3, htp_method_PUT },
+    { "POST",      4, htp_method_POST },    { "HEAD",      4, htp_method_HEAD },
+    { "COPY",      4, htp_method_COPY },    { "MOVE",      4, htp_method_MOVE },
+    { "LOCK",      4, htp_method_LOCK },    { "PATCH",     5, htp_method_PATCH },
+    { "TRACE",     5, htp_method_TRACE },   { "MKCOL",     5, htp_method_MKCOL },
+    { "DELETE",    6, htp_method_DELETE },  { "UNLOCK",    6, htp_method_UNLOCK },
+    { "OPTIONS",   7, htp_method_OPTIONS }, { "CONNECT",   7, htp_method_CONNECT },
+    { "PROPFIND",  8, htp_method_PROPFIND },
+    { "PROPPATCH", 9, htp_method_PROPPATCH },   /* "PROPATCH" in method_strmap */
+};
+
 static htp_method
 method_from(const char * m, size_t n)
 {
-    for (int i = htp_method_GET; i < htp_method_LAST; i++)
+    for (size_t i = 0; i < sizeof(methods) / sizeof(methods[0]); i++)
     {
-        /* the table spells PROPPATCH "PROPATCH"; match the real name */
-        if (i != htp_method_PROPPATCH &&
-            strlen(method_strmap[i]) == n && memcmp(method_strmap[i], m, n) == 0)
+        if (methods[i].len == n && memcmp(methods[i].name, m, n) == 0)
         {
-            return (htp_method)i;
+            return methods[i].method;
         }
-    }
-
-    if (n == 9 && memcmp(m, "PROPPATCH", 9) == 0)
-    {
-        return htp_method_PROPPATCH;
     }
 
     return htp_method_UNKNOWN;
 }
 
-/* The next run of non-blank bytes in *cur; *cur moves past it and the
- * blanks that follow. */
+/* The next SP-delimited token of a start line; *cur moves past it and the
+ * spaces that follow. (RFC 9112 separates with SP; extra SPs are allowed.) */
 static htstring_t
 next_token(htstring_t * cur)
 {
     const char * s = cur->startp, * e = s + cur->len;
     const char * t;
 
-    while (s < e && (*s == ' ' || *s == '\t'))
+    while (s < e && *s == ' ')
     {
         s++;
     }
 
-    for (t = s; t < e && *t != ' ' && *t != '\t'; t++)
+    if ((t = memchr(s, ' ', (size_t)(e - s))) == NULL)
     {
+        t = e;
     }
 
     htstring_t tok = { .startp = s, .len = (size_t)(t - s) };
 
-    while (t < e && (*t == ' ' || *t == '\t'))
+    while (t < e && *t == ' ')
     {
         t++;
     }
@@ -638,7 +649,18 @@ parse_header(htparser * p, htparse_hooks * hooks, htstring_t line, bool trailer)
     name.len     = (size_t)(colon - line.startp);
     value.startp = colon + 1;
     value.len    = line.len - name.len - 1;
-    htstring_trim(&value);
+
+    while (value.len && (value.startp[0] == ' ' || value.startp[0] == '\t'))
+    {
+        value.startp++;
+        value.len--;
+    }
+
+    while (value.len && (value.startp[value.len - 1] == ' ' ||
+                         value.startp[value.len - 1] == '\t'))
+    {
+        value.len--;
+    }
 
     /* parser.c reports trailer fields through the same hooks; framing
      * fields among them mean nothing and are not looked at */
@@ -905,70 +927,75 @@ message_reset(htparser * p)
     p->empty_lines      = 0;
 }
 
-/* The head of the message: lines until the empty one. */
+/* The head of the message (or the trailer section): its lines, for as long
+ * as complete ones are there (Java: the parse() loop over readLine()).
+ * Returns the bytes consumed; 0 means a line is not complete yet. */
 static size_t
 parse_head(htparser * p, htparse_hooks * hooks, const char * data, size_t len)
 {
-    htstring_t line;
-    size_t     used = 0;
-    int        r    = take_line(p, data, len, &line, &used);
+    const size_t max_headers = p->config->max_header_count;
+    size_t       off         = 0;
 
-    if (r <= 0)
+    while ((p->state == S_HEAD_LINE || p->state == S_HEADERS || p->state == S_TRAILERS) &&
+           !(p->flags & F_PAUSED))
     {
-        if (r < 0)
+        htstring_t line;
+        size_t     used = 0;
+        int        r    = take_line(p, data + off, len - off, &line, &used);
+
+        if (r <= 0)
+        {
+            if (r < 0)
+            {
+                fail(p, htparse_error_too_big);
+            }
+
+            break;
+        }
+
+        off += used;
+
+        if (p->state == S_HEAD_LINE)
+        {
+            bool ok = p->type == htp_type_request ? parse_request_line(p, hooks, line)
+                                                  : parse_status_line(p, line);
+
+            if (ok)
+            {
+                p->state = S_HEADERS;
+                (void)HOOK(p, hooks, on_hdrs_begin);
+            }
+        }
+        else if (line.len == 0)                 /* end of the head (or trailers) */
+        {
+            if (p->state == S_TRAILERS)
+            {
+                p->state = S_COMPLETE;
+            }
+            else if (framing(p))
+            {
+                p->state = p->body == B_NONE ? S_COMPLETE : S_BODY;
+
+                /* callers inspect framing here and may set skip_body or pause */
+                if (HOOK(p, hooks, on_hdrs_complete) && (p->flags & F_SKIP_BODY))
+                {
+                    p->body  = B_NONE;
+                    p->state = S_COMPLETE;
+                }
+            }
+        }
+        else if (max_headers && p->header_count >= max_headers)
         {
             fail(p, htparse_error_too_big);
         }
-
-        return 0;
-    }
-
-    if (p->state == S_HEAD_LINE)
-    {
-        bool ok = p->type == htp_type_request ? parse_request_line(p, hooks, line)
-                                              : parse_status_line(p, line);
-
-        if (ok)
+        else
         {
-            p->state = S_HEADERS;
-            (void)HOOK(p, hooks, on_hdrs_begin);
+            p->header_count++;
+            parse_header(p, hooks, line, p->state == S_TRAILERS);
         }
-
-        return used;
     }
 
-    if (line.len == 0)                          /* end of the head (or trailers) */
-    {
-        if (p->state == S_TRAILERS)
-        {
-            p->state = S_COMPLETE;
-            return used;
-        }
-
-        if (framing(p))
-        {
-            p->state = p->body == B_NONE ? S_COMPLETE : S_BODY;
-
-            /* callers inspect framing here and may set skip_body or pause */
-            if (HOOK(p, hooks, on_hdrs_complete) && (p->flags & F_SKIP_BODY))
-            {
-                p->body  = B_NONE;
-                p->state = S_COMPLETE;
-            }
-        }
-
-        return used;
-    }
-
-    if (p->config->max_header_count && p->header_count >= p->config->max_header_count)
-    {
-        fail(p, htparse_error_too_big);
-        return 0;
-    }
-
-    p->header_count++;
-    parse_header(p, hooks, line, p->state == S_TRAILERS);
-    return used;
+    return off;
 }
 
 size_t
