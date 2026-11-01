@@ -178,7 +178,7 @@ fail(htparser * p, htpparse_error e)
  * its full length with the line end in *used. Returns 1, 0 if the line is
  * not complete yet, -1 if it is (or is already) longer than allowed.
  */
-static int
+static inline int
 take_line(htparser * p, const char * data, size_t len, htstring_t * line, size_t * used)
 {
     size_t       max = p->config->max_line_length;
@@ -245,7 +245,7 @@ method_from(const char * m, size_t n)
 
 /* The next SP-delimited token of a start line; *cur moves past it and the
  * spaces that follow. (RFC 9112 separates with SP; extra SPs are allowed.) */
-static htstring_t
+static inline htstring_t
 next_token(htstring_t * cur)
 {
     const char * s = cur->startp, * e = s + cur->len;
@@ -274,7 +274,7 @@ next_token(htstring_t * cur)
 }
 
 /* "HTTP/d.d" */
-static bool
+static inline bool
 parse_version(htparser * p, htstring_t v)
 {
     const char * s = v.startp;
