@@ -4,6 +4,10 @@ option (EVHTP_DISABLE_SSL   "Disable ssl support"          OFF)
 # -DEVHTP_DISABLE_H2=ON
 option(EVHTP_DISABLE_H2 "Disable HTTP/2 support via nghttp2" OFF)
 
+# -DEVHTP_DISABLE_UPSTREAM_H2=OFF: client TLS connections offer h2 in ALPN
+# too (ON: http/1.1 only, as before this option existed)
+option(EVHTP_DISABLE_UPSTREAM_H2 "Offer only http/1.1 on client TLS connections" ON)
+
 # -DEVHTP_DISABLE_EVTHR=ON
 option (EVHTP_DISABLE_EVTHR "Disable evthread support"     OFF)
 

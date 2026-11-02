@@ -5,7 +5,8 @@
  */
 
 //#define EVHTP_DISABLE_H2
-#define EVHTP_DISABLE_UPSTREAM_H2
+/* EVHTP_DISABLE_UPSTREAM_H2 (CMake option, ON by default): client TLS
+ * connections offer only http/1.1 in ALPN. */
 
 #define _GNU_SOURCE
 #include <stdlib.h>
@@ -6232,6 +6233,10 @@ h2__send_cb_(nghttp2_session * session,
     return (nghttp2_ssize)length;
 }
 
+/* Client flow-control windows (see evhtp_h2_conn_ctx_new) */
+#define HTP_H2_CLIENT_STREAM_WINDOW (1 << 20)   /* 1 MiB per stream          */
+#define HTP_H2_CLIENT_CONN_WINDOW   (16 << 20)  /* 16 MiB for the connection */
+
 evhtp_h2_conn_ctx_t *
 evhtp_h2_conn_ctx_new(evhtp_connection_t * conn, evhtp_type role)
 {
@@ -6300,25 +6305,30 @@ nghttp2_session_callbacks_set_on_stream_close_callback(cbs,
         nghttp2_submit_settings(ctx->session, NGHTTP2_FLAG_NONE, iv, 2);
     }
     else {
+        /* Client SETTINGS: plain values of our own, not a browser's. An
+         * HTTP/2 fingerprint copied from Chrome over a TLS handshake that
+         * is OpenSSL's is a client claiming to be what it is not - what bot
+         * detection looks for. Push is refused (this client cannot take
+         * it); the windows are large enough for full-speed downloads with
+         * our manual flow control (nghttp2's 64 KB default would throttle
+         * them to 64 KB per round trip). */
+        nghttp2_settings_entry iv[] = {
+            { NGHTTP2_SETTINGS_ENABLE_PUSH,         0 },
+            { NGHTTP2_SETTINGS_INITIAL_WINDOW_SIZE, HTP_H2_CLIENT_STREAM_WINDOW },
+        };
+
         nghttp2_session_client_new2(&ctx->session, cbs, ctx, opt);
 
-//nghttp2_settings_entry iv[] = {
-//    { NGHTTP2_SETTINGS_MAX_CONCURRENT_STREAMS, 128 },
-//};
-nghttp2_settings_entry iv[] = {
-    { NGHTTP2_SETTINGS_HEADER_TABLE_SIZE, 65536 },
-    { NGHTTP2_SETTINGS_ENABLE_PUSH, 0 },
-    { NGHTTP2_SETTINGS_INITIAL_WINDOW_SIZE, 6291456 },
-    { NGHTTP2_SETTINGS_MAX_HEADER_LIST_SIZE, 262144 },
-};
-if (nghttp2_submit_settings(ctx->session, NGHTTP2_FLAG_NONE, iv, 4) != 0)
-    log_error("nghttp2_submit_settings() ERROR");
-    /* Chrome sends connection-level WINDOW_UPDATE immediately after SETTINGS */
-nghttp2_submit_window_update(ctx->session, NGHTTP2_FLAG_NONE,
-    0, 15663105);
-    /* Client submits connection preface (magic + SETTINGS) automatically
-         * when nghttp2_session_client_new2() is called — just need to flush */
-//        nghttp2_submit_settings(ctx->session, NGHTTP2_FLAG_NONE, NULL, 0);
+        if (nghttp2_submit_settings(ctx->session, NGHTTP2_FLAG_NONE, iv,
+                                    sizeof(iv) / sizeof(iv[0])) != 0) {
+            log_error("nghttp2_submit_settings() failed");
+        }
+
+        /* the connection window, beyond the 64 KB every connection starts with */
+        if (nghttp2_session_set_local_window_size(ctx->session, NGHTTP2_FLAG_NONE, 0,
+                                                  HTP_H2_CLIENT_CONN_WINDOW) != 0) {
+            log_error("nghttp2_session_set_local_window_size() failed");
+        }
     }
 
     /* Flush the initial frames (SETTINGS for server, preface+SETTINGS for client) */
@@ -6647,34 +6657,121 @@ evhtp_h2_reset_stream(evhtp_request_t * req, uint32_t error_code)
         nv_->flags    = NGHTTP2_NV_FLAG_NONE;       \
     } while (0)
 
-static inline bool
-skip_hop_by_hop_request_header(evhtp_kv_t* kv)
+/* Is name (len bytes) one of the tokens of a Connection header value? */
+static bool
+h2__connection_lists(const char * conn_val, const char * name, size_t len)
 {
-    int c = tolower(kv->key[0]);
-    if (c == 'h' || c == 'c' || c == 'k' || c == 't') {
-        switch (kv->klen)
-        {
-            case 4:
-                if (strncasecmp(kv->key, "host", kv->klen) == 0) {
-                    return true;
-                }
-                break;
-            case 10:
-                if (strncasecmp(kv->key, "connection", kv->klen) == 0 ||
-                    strncasecmp(kv->key, "keep-alive", kv->klen) == 0) {
-                    return true;
-                }
-                break;
-            case 17:
-                if (strncasecmp(kv->key, "transfer-encoding", kv->klen) == 0) {
-                    return true;
-                }
-                break;
-            default:
-                break;
+    const char * p = conn_val;
+
+    while (p && *p) {
+        const char * e;
+
+        while (*p == ' ' || *p == '\t' || *p == ',') {
+            p++;
+        }
+
+        for (e = p; *e && *e != ','; e++) {
+        }
+
+        size_t n = (size_t)(e - p);
+
+        while (n && (p[n - 1] == ' ' || p[n - 1] == '\t')) {
+            n--;
+        }
+
+        if (n == len && strncasecmp(p, name, len) == 0) {
+            return true;
+        }
+
+        p = e;
+    }
+
+    return false;
+}
+
+/* Does any Connection header (there may be several) name this field? */
+static bool
+h2__named_by_connection(evhtp_headers_t * headers, const char * name, size_t len)
+{
+    evhtp_kv_t * kv;
+
+    TAILQ_FOREACH(kv, headers, next) {
+        if (kv->klen == 10 && strncasecmp(kv->key, "connection", 10) == 0 &&
+            h2__connection_lists(kv->val, name, len)) {
+            return true;
         }
     }
+
     return false;
+}
+
+/* Request header fields that must not be sent over HTTP/2 (RFC 9113 8.2.2):
+ * the connection-specific ones, TE other than "trailers", and any field a
+ * Connection header names. Host is sent as :authority instead. */
+static inline bool
+skip_hop_by_hop_request_header(evhtp_kv_t* kv, evhtp_headers_t * headers)
+{
+    static const char * const names[] = {
+        "host", "connection", "keep-alive", "proxy-connection",
+        "transfer-encoding", "upgrade",
+    };
+
+    for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+        if (kv->klen == strlen(names[i]) && strncasecmp(kv->key, names[i], kv->klen) == 0) {
+            return true;
+        }
+    }
+
+    if (kv->klen == 2 && strncasecmp(kv->key, "te", 2) == 0) {
+        return !(kv->vlen == 8 && strncasecmp(kv->val, "trailers", 8) == 0);
+    }
+
+    return h2__named_by_connection(headers, kv->key, kv->klen);
+}
+
+/* :authority for a request without a Host header: the server name TLS was
+ * given (SNI), else the address connected to - with the port unless 443. */
+static const char *
+h2__client_authority(evhtp_connection_t * c, char * buf, size_t len)
+{
+    struct sockaddr_storage ss;
+    socklen_t               sl   = sizeof(ss);
+    const char            * name = c->ssl ? SSL_get_servername(c->ssl, TLSEXT_NAMETYPE_host_name) : NULL;
+    char                    ip[INET6_ADDRSTRLEN];
+    unsigned                port = 0;
+    evutil_socket_t         fd   = c->bev ? bufferevent_getfd(c->bev) : -1;
+
+    if (fd >= 0 && getpeername(fd, (struct sockaddr *)&ss, &sl) == 0) {
+        if (ss.ss_family == AF_INET) {
+            struct sockaddr_in * in = (struct sockaddr_in *)&ss;
+
+            port = ntohs(in->sin_port);
+            evutil_inet_ntop(AF_INET, &in->sin_addr, ip, sizeof(ip));
+        } else if (ss.ss_family == AF_INET6) {
+            struct sockaddr_in6 * in6 = (struct sockaddr_in6 *)&ss;
+
+            port = ntohs(in6->sin6_port);
+            evutil_inet_ntop(AF_INET6, &in6->sin6_addr, ip, sizeof(ip));
+        } else {
+            ip[0] = '\0';
+        }
+    } else {
+        ip[0] = '\0';
+    }
+
+    if (name == NULL && ip[0] == '\0') {
+        return "";
+    }
+
+    snprintf(buf, len, name ? "%s" : strchr(ip, ':') ? "[%s]" : "%s", name ? name : ip);
+
+    if (port && port != 443) {
+        size_t n = strlen(buf);
+
+        snprintf(buf + n, len - n, ":%u", port);
+    }
+
+    return buf;
 }
 
 int
@@ -6687,12 +6784,13 @@ evhtp_h2_make_request(evhtp_connection_t * c, evhtp_request_t * r,
     evhtp_kv_t          * kv;
     nghttp2_nv          * nva;
     size_t                nvlen, i;
+    char                  authority_buf[300];
 
     /* pseudo-headers: :method, :path, :scheme, :authority */
     nvlen = 4;
     TAILQ_FOREACH(kv, r->headers_out, next) {
         /* skip hop-by-hop headers forbidden in h2 */
-        if (skip_hop_by_hop_request_header(kv))
+        if (skip_hop_by_hop_request_header(kv, r->headers_out))
             continue;
         nvlen++;
     }
@@ -6708,10 +6806,15 @@ evhtp_h2_make_request(evhtp_connection_t * c, evhtp_request_t * r,
 
     /* :authority from Host header if present, else from connection target */
     const char * authority = evhtp_header_find_n(r->headers_out, "host", 4);
-    MAKE_NV2(nva[i++], ":authority", authority ? authority : "");
+
+    if (authority == NULL) {
+        authority = h2__client_authority(c, authority_buf, sizeof(authority_buf));
+    }
+
+    MAKE_NV2(nva[i++], ":authority", authority);
 
     TAILQ_FOREACH(kv, r->headers_out, next) {
-        if (skip_hop_by_hop_request_header(kv))
+        if (skip_hop_by_hop_request_header(kv, r->headers_out))
             continue;
         nva[i].name     = (uint8_t *)kv->key;
         nva[i].namelen  = kv->klen;
