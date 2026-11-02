@@ -217,6 +217,10 @@ if(EVHTP_USE_DEFER_ACCEPT)
     target_compile_definitions(evhtp PUBLIC USE_DEFER_ACCEPT)
 endif()
 
+if(EVHTP_DISABLE_UPSTREAM_H2)
+    target_compile_definitions(evhtp PRIVATE EVHTP_DISABLE_UPSTREAM_H2)
+endif()
+
 if(EVHTP_DISABLE_H2)
     target_compile_definitions(evhtp PUBLIC EVHTP_DISABLE_H2)
 endif()
@@ -358,6 +362,7 @@ message(STATUS "${BoldBlue}EVHTP_BUILD_SHARED${ColourReset}       : ${BoldGreen}
 message(STATUS "${BoldBlue}EVHTP_USE_JEMALLOC${ColourReset}       : ${BoldGreen} ${EVHTP_USE_JEMALLOC}${ColourReset}")
 message(STATUS "${BoldBlue}EVHTP_USE_TCMALLOC${ColourReset}       : ${BoldGreen} ${EVHTP_USE_TCMALLOC}${ColourReset}")
 message(STATUS "${BoldBlue}EVHTP_DISABLE_H2${ColourReset}         : ${BoldGreen} ${EVHTP_DISABLE_H2}${ColourReset}")
+message(STATUS "${BoldBlue}EVHTP_DISABLE_UPSTREAM_H2${ColourReset}: ${BoldGreen} ${EVHTP_DISABLE_UPSTREAM_H2}${ColourReset}")
 message("")
 message(STATUS "${Blue}CMAKE_BUILD_TYPE${ColourReset}         : " ${BoldRed}${CMAKE_BUILD_TYPE}${ColourReset})
 message(STATUS "${Blue}CMAKE_INSTALL_PREFIX${ColourReset}     : " ${BoldMagenta}${CMAKE_INSTALL_PREFIX}${ColourReset})
