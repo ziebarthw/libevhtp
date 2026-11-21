@@ -5,6 +5,7 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include <stdatomic.h>
+#include <stdalign.h>
 #include <limits.h>
 #include <string.h>
 #ifndef WIN32
@@ -23,11 +24,15 @@
 #include "evhtp/config.h"
 #include "internal.h"
 #include "evhtp/mpsc-queue.h"
-#include "evhtp/spsc_queue.h"
 #include "evhtp/thread.h"
 
 #ifndef CACHE_LINE_SIZE
 #define CACHE_LINE_SIZE 64
+#endif
+
+/* Most used commands kept for reuse by each sending thread. */
+#ifndef EVTHR_MSG_CACHE_MAX
+#define EVTHR_MSG_CACHE_MAX 64
 #endif
 
 //#define WITH_COUNTERS
@@ -57,8 +62,8 @@ typedef struct evthr_cmd        evthr_cmd_t;
 typedef struct evthr_pool_slist evthr_pool_slist_t;
 
 struct evthr_cmd {
-    struct mpsc_queue_node node;
-    struct producer_q    * msg_cache_p;
+    struct mpsc_queue_node node;  /* in the target's queue, then the owner's cache */
+    evthr_t              * owner; /* the sending thread, or NULL: free after use */
     void                 * args;
     evthr_cb               cb;
 };
@@ -73,9 +78,11 @@ struct evthr_pool {
 struct evthr {
     struct mpsc_queue queue;
 
-    struct producer_q msg_cache_p;
-    struct consumer_q msg_cache_c;
-    void            * msg_cache_buf;
+    /* Used commands coming back for this thread to send again. Every
+     * thread that ran one of them puts it back, so there can be many
+     * producers at once; only this thread takes them out. */
+    struct mpsc_queue msg_cache;
+    _Atomic size_t    msg_cache_len;
 
     ev_t          * msg_event;
     ev_t          * stop_event;
@@ -118,16 +125,21 @@ _evthr_run_callbacks(void *args)
     while (mpsc_queue_poll(&thread->queue, &node) == MPSC_QUEUE_ITEM)
     {
         evthr_cmd_t *cmd = (evthr_cmd_t *)node;
-        struct producer_q* pq = cmd->msg_cache_p;
+        evthr_t *owner = cmd->owner;
         cmd->cb(thread, cmd->args, thread->arg);
-        if (!pq)
+        if (!owner)
         {
             free(cmd);
         }
-        else if (spsc_enqueue(pq, cmd) != 0)
+        else if (atomic_fetch_add_explicit(&owner->msg_cache_len, 1, memory_order_relaxed) >= EVTHR_MSG_CACHE_MAX)
         {
+            atomic_fetch_sub_explicit(&owner->msg_cache_len, 1, memory_order_relaxed);
             IF_COUNTERS(++thread->free_count;)
             free(cmd);
+        }
+        else
+        {
+            mpsc_queue_insert(&owner->msg_cache, &cmd->node);
         }
         IF_COUNTERS(++thread->msg_count;)
         IF_HEAD(atomic_fetch_add_explicit(&thread->head, 1, memory_order_relaxed);)
@@ -221,7 +233,16 @@ evthr_defer(evthr_t * thread, evthr_cb cb, void * arg)
         return EVTHR_RES_NOCB;
     }
 
-    cmd = sender ? spsc_dequeue(&sender->msg_cache_c) : NULL;
+    cmd = NULL;
+    if (sender) {
+        struct mpsc_queue_node *node;
+        /* EMPTY, or RETRY while a worker is part-way through putting one
+         * back: allocate rather than wait. */
+        if (mpsc_queue_poll(&sender->msg_cache, &node) == MPSC_QUEUE_ITEM) {
+            atomic_fetch_sub_explicit(&sender->msg_cache_len, 1, memory_order_relaxed);
+            cmd = (evthr_cmd_t *)node;
+        }
+    }
     if (cmd) {
         IF_COUNTERS(++sender->reuse_count;)
     }
@@ -232,7 +253,7 @@ evthr_defer(evthr_t * thread, evthr_cb cb, void * arg)
         }
     }
 
-    cmd->msg_cache_p = sender ? &sender->msg_cache_p : NULL;
+    cmd->owner = sender;
     cmd->cb = cb;
     cmd->args = arg;
 
@@ -408,11 +429,8 @@ _evthr_new(evthr_init_cb init_cb, evthr_exit_cb exit_cb, void * args)
 
     mpsc_queue_init(&thread->queue);
 
-    size_t size = 64;
-    void* buffer = malloc(size * sizeof(void**));
-    spsc_queue_init(&thread->msg_cache_p, &thread->msg_cache_c, buffer, size);
-
-    thread->msg_cache_buf = buffer;
+    mpsc_queue_init(&thread->msg_cache);
+    atomic_init(&thread->msg_cache_len, 0);
 
     if (pthread_mutex_init(&thread->lock, NULL)) {
         evthr_free(thread);
@@ -489,14 +507,13 @@ evthr_free(evthr_t * thread)
         event_base_free(thread->evbase);
     }
 
-    if (thread->msg_cache_buf) {
-        evthr_cmd_t* cmd;
-        while ((cmd = spsc_dequeue(&thread->msg_cache_c)))
+    {
+        struct mpsc_queue_node *node;
+        while (mpsc_queue_poll(&thread->msg_cache, &node) == MPSC_QUEUE_ITEM)
         {
             IF_COUNTERS(++thread->free_count;)
-            free(cmd);
+            free(node);
         }
-        free(thread->msg_cache_buf);
     }
 
 IF_COUNTERS(printf("%s - %p, %d alloc'd, %d freed, %d reused, %d processed\n", __func__, thread, thread->alloc_count, thread->free_count, thread->reuse_count, thread->msg_count);)
@@ -610,19 +627,31 @@ evthr_pool_defer_all_sync(evthr_pool_t * pool, evthr_cb cb, void * arg)
 
     ctx.nthreads = pool->nthreads;
 
-    evthr_res res = evthr_pool_defer_all(pool, defer_sync_cb, &ctx);
-    if (res != EVTHR_RES_OK) {
-        return res;
+    /* |ctx| is on this stack, so wait for every thread that was sent it,
+     * even when sending to a later one fails. */
+    evthr_res res = EVTHR_RES_OK;
+    size_t sent = 0;
+    for (; sent < pool->nthreads; ++sent) {
+        res = evthr_defer(pool->threads[sent], defer_sync_cb, &ctx);
+        if (res == EVTHR_RES_RETRY) {
+            /* Queued; only the wakeup failed, so it still runs. */
+            ++sent;
+            break;
+        }
+        if (res != EVTHR_RES_OK) {
+            break;
+        }
     }
 
     pthread_mutex_lock(&ctx.mut);
+    ctx.nthreads -= pool->nthreads - sent;
     while (ctx.nthreads > 0)
     {
         pthread_cond_wait(&ctx.cond, &ctx.mut);
     }
     pthread_mutex_unlock(&ctx.mut);
 
-    return EVTHR_RES_OK;
+    return res;
 }
 
 typedef struct defer_completed_ctx defer_completed_ctx_t;
