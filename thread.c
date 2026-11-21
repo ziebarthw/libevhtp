@@ -6,6 +6,7 @@
 #include <stdint.h>
 #include <stdatomic.h>
 #include <stdalign.h>
+#include <stdbool.h>
 #include <limits.h>
 #include <string.h>
 #ifndef WIN32
@@ -59,14 +60,98 @@
 static __thread evthr_t * tls_thread;
 
 typedef struct evthr_cmd        evthr_cmd_t;
+typedef struct evthr_msg_cache  evthr_msg_cache_t;
 typedef struct evthr_pool_slist evthr_pool_slist_t;
 
 struct evthr_cmd {
-    struct mpsc_queue_node node;  /* in the target's queue, then the owner's cache */
-    evthr_t              * owner; /* the sending thread, or NULL: free after use */
+    struct mpsc_queue_node node;  /* in the target's queue, then the sender's cache */
+    evthr_msg_cache_t    * cache; /* the sender's cache (a reference), or NULL: free after use */
     void                 * args;
     evthr_cb               cb;
 };
+
+/* Used commands coming back for a thread to send again. Every thread that
+ * ran one of them puts it back, so there can be many producers at once;
+ * only the owning thread takes them out.
+ *
+ * The cache outlives its thread while commands it sent are still out: the
+ * thread holds one reference and every command in flight holds another.
+ * evthr_free() closes it (commands coming back are then freed instead of
+ * kept), and whoever drops the last reference frees it, with anything put
+ * back in the meantime. */
+struct evthr_msg_cache {
+    struct mpsc_queue queue;
+    _Atomic size_t    len;
+    _Atomic size_t    refs;
+    _Atomic bool      closed;
+};
+
+static evthr_msg_cache_t *
+_evthr_msg_cache_new(void)
+{
+    evthr_msg_cache_t * cache = calloc(1, sizeof(*cache));
+    if (cache) {
+        mpsc_queue_init(&cache->queue);
+        atomic_init(&cache->len, 0);
+        atomic_init(&cache->refs, 1);
+        atomic_init(&cache->closed, false);
+    }
+    return cache;
+}
+
+/* Only one thread at a time: the owner, or whoever holds the last reference. */
+static void
+_evthr_msg_cache_drain(evthr_msg_cache_t * cache)
+{
+    struct mpsc_queue_node * node;
+    while (mpsc_queue_poll(&cache->queue, &node) == MPSC_QUEUE_ITEM) {
+        free(node);
+    }
+}
+
+static void
+_evthr_msg_cache_unref(evthr_msg_cache_t * cache)
+{
+    if (atomic_fetch_sub_explicit(&cache->refs, 1, memory_order_acq_rel) != 1) {
+        return;
+    }
+    /* Every other holder put its command back before letting go, so
+     * nothing is part-way through being inserted. */
+    _evthr_msg_cache_drain(cache);
+    free(cache);
+}
+
+/* On the owning thread, as it's freed. */
+static void
+_evthr_msg_cache_close(evthr_msg_cache_t * cache)
+{
+    if (cache == NULL) {
+        return;
+    }
+    atomic_store_explicit(&cache->closed, true, memory_order_release);
+    _evthr_msg_cache_drain(cache);
+    _evthr_msg_cache_unref(cache);
+}
+
+/* After a command has run: keep it for its sender to reuse, or free it.
+ * Either way, drops the command's reference to the cache. */
+static void
+_evthr_msg_cache_put(evthr_msg_cache_t * cache, evthr_cmd_t * cmd)
+{
+    bool keep = !atomic_load_explicit(&cache->closed, memory_order_acquire);
+    if (keep && atomic_fetch_add_explicit(&cache->len, 1, memory_order_relaxed) >= EVTHR_MSG_CACHE_MAX) {
+        atomic_fetch_sub_explicit(&cache->len, 1, memory_order_relaxed);
+        keep = false;
+    }
+    if (keep) {
+        /* Even if the owner closes the cache now, this stays until whoever
+         * drops the last reference drains it. */
+        mpsc_queue_insert(&cache->queue, &cmd->node);
+    } else {
+        free(cmd);
+    }
+    _evthr_msg_cache_unref(cache);
+}
 
 struct evthr_pool {
     evthr_t       ** threads;
@@ -78,11 +163,7 @@ struct evthr_pool {
 struct evthr {
     struct mpsc_queue queue;
 
-    /* Used commands coming back for this thread to send again. Every
-     * thread that ran one of them puts it back, so there can be many
-     * producers at once; only this thread takes them out. */
-    struct mpsc_queue msg_cache;
-    _Atomic size_t    msg_cache_len;
+    evthr_msg_cache_t * msg_cache; /* see struct evthr_msg_cache */
 
     ev_t          * msg_event;
     ev_t          * stop_event;
@@ -125,21 +206,15 @@ _evthr_run_callbacks(void *args)
     while (mpsc_queue_poll(&thread->queue, &node) == MPSC_QUEUE_ITEM)
     {
         evthr_cmd_t *cmd = (evthr_cmd_t *)node;
-        evthr_t *owner = cmd->owner;
+        evthr_msg_cache_t *cache = cmd->cache;
         cmd->cb(thread, cmd->args, thread->arg);
-        if (!owner)
+        if (!cache)
         {
-            free(cmd);
-        }
-        else if (atomic_fetch_add_explicit(&owner->msg_cache_len, 1, memory_order_relaxed) >= EVTHR_MSG_CACHE_MAX)
-        {
-            atomic_fetch_sub_explicit(&owner->msg_cache_len, 1, memory_order_relaxed);
-            IF_COUNTERS(++thread->free_count;)
             free(cmd);
         }
         else
         {
-            mpsc_queue_insert(&owner->msg_cache, &cmd->node);
+            _evthr_msg_cache_put(cache, cmd);
         }
         IF_COUNTERS(++thread->msg_count;)
         IF_HEAD(atomic_fetch_add_explicit(&thread->head, 1, memory_order_relaxed);)
@@ -233,13 +308,15 @@ evthr_defer(evthr_t * thread, evthr_cb cb, void * arg)
         return EVTHR_RES_NOCB;
     }
 
+    evthr_msg_cache_t *cache = sender ? sender->msg_cache : NULL;
+
     cmd = NULL;
-    if (sender) {
+    if (cache) {
         struct mpsc_queue_node *node;
         /* EMPTY, or RETRY while a worker is part-way through putting one
          * back: allocate rather than wait. */
-        if (mpsc_queue_poll(&sender->msg_cache, &node) == MPSC_QUEUE_ITEM) {
-            atomic_fetch_sub_explicit(&sender->msg_cache_len, 1, memory_order_relaxed);
+        if (mpsc_queue_poll(&cache->queue, &node) == MPSC_QUEUE_ITEM) {
+            atomic_fetch_sub_explicit(&cache->len, 1, memory_order_relaxed);
             cmd = (evthr_cmd_t *)node;
         }
     }
@@ -253,7 +330,11 @@ evthr_defer(evthr_t * thread, evthr_cb cb, void * arg)
         }
     }
 
-    cmd->owner = sender;
+    /* This thread holds its own reference, so a relaxed increment will do. */
+    if (cache) {
+        atomic_fetch_add_explicit(&cache->refs, 1, memory_order_relaxed);
+    }
+    cmd->cache = cache;
     cmd->cb = cb;
     cmd->args = arg;
 
@@ -429,8 +510,10 @@ _evthr_new(evthr_init_cb init_cb, evthr_exit_cb exit_cb, void * args)
 
     mpsc_queue_init(&thread->queue);
 
-    mpsc_queue_init(&thread->msg_cache);
-    atomic_init(&thread->msg_cache_len, 0);
+    if (!(thread->msg_cache = _evthr_msg_cache_new())) {
+        evthr_free(thread);
+        return NULL;
+    }
 
     if (pthread_mutex_init(&thread->lock, NULL)) {
         evthr_free(thread);
@@ -507,14 +590,8 @@ evthr_free(evthr_t * thread)
         event_base_free(thread->evbase);
     }
 
-    {
-        struct mpsc_queue_node *node;
-        while (mpsc_queue_poll(&thread->msg_cache, &node) == MPSC_QUEUE_ITEM)
-        {
-            IF_COUNTERS(++thread->free_count;)
-            free(node);
-        }
-    }
+    /* Commands this thread sent may still be coming back. */
+    _evthr_msg_cache_close(thread->msg_cache);
 
 IF_COUNTERS(printf("%s - %p, %d alloc'd, %d freed, %d reused, %d processed\n", __func__, thread, thread->alloc_count, thread->free_count, thread->reuse_count, thread->msg_count);)
 
